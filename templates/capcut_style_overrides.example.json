@@ -1,0 +1,74 @@
+{
+  "capcut": {
+    "draft": {
+      "width": 1080,
+      "height": 1920,
+      "fps": 30,
+      "video_volume": 0.85,
+      "title_duration_sec": 3.8
+    },
+    "title": {
+      "font": "Anton",
+      "style": {
+        "size": 14,
+        "bold": true,
+        "align": "center",
+        "color": "#FFFFFF"
+      },
+      "border": {
+        "color": "#111111",
+        "width": 35,
+        "alpha": 1.0
+      },
+      "clip": {
+        "transform_y": -0.72
+      }
+    },
+    "point": {
+      "font": "Montserrat",
+      "style": {
+        "size": 10,
+        "bold": true,
+        "color": "#FFE96A"
+      },
+      "background": {
+        "color": "#111111",
+        "alpha": 0.45,
+        "style": 1,
+        "round_radius": 0.08,
+        "height": 0.16,
+        "width": 0.92
+      },
+      "clip": {
+        "transform_y": 0.12
+      },
+      "material_patch": {
+        "has_shadow": true,
+        "shadow_alpha": 0.8,
+        "shadow_color": "#000000",
+        "shadow_distance": 5.0,
+        "shadow_smoothing": 0.45
+      }
+    },
+    "narration": {
+      "voice": "onyx",
+      "speed": 1.08,
+      "volume": 1.0
+    }
+  },
+  "point_captions": [
+    {
+      "text": "강조 자막 예시",
+      "target_start": 0.0,
+      "target_end": 2.5,
+      "capcut": {
+        "style": {
+          "color": "#FF4D6D"
+        },
+        "clip": {
+          "transform_y": 0.2
+        }
+      }
+    }
+  ]
+}

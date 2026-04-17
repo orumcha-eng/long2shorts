@@ -1,0 +1,14 @@
+.venv/
+.python_packages/
+__pycache__/
+*.py[cod]
+
+analysis/
+generated_audio/
+
+*.mp3
+*.mp4
+*.wav
+*.m4a
+
+.env

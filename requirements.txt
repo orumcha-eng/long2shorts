@@ -1,0 +1,4 @@
+openai>=1.30,<2
+python-dotenv>=1,<2
+pymediainfo>=6,<7
+imageio-ffmpeg>=0.5,<1

@@ -1,6 +1,7 @@
 import argparse
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -8,6 +9,12 @@ from pymediainfo import MediaInfo
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+def configure_stdout() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
 
 
 def has_audio_track(path: Path) -> bool:
@@ -49,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    configure_stdout()
     args = build_parser().parse_args()
     source_video = args.source_video.resolve()
     package_path = args.package.resolve()

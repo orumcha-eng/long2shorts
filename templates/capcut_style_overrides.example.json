@@ -5,24 +5,54 @@
       "height": 1920,
       "fps": 30,
       "video_volume": 0.85,
-      "title_duration_sec": 3.8
+      "title_duration_sec": 3.8,
+      "title_full_duration": true
+    },
+    "template": {
+      "enabled": true,
+      "image_path": "short_templet.png",
+      "clip": {
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "transform_x": 0.0,
+        "transform_y": 0.0
+      }
+    },
+    "text_overlay": {
+      "enabled": true
     },
     "title": {
-      "font": "Anton",
-      "style": {
-        "size": 14,
-        "bold": true,
-        "align": "center",
-        "color": "#FFFFFF"
+      "font_path": "assets/fonts/Jua-Regular.ttf",
+      "line1": {
+        "box": [290, 70, 1040, 165],
+        "max_chars": 12,
+        "image_font_size": 78,
+        "min_image_font_size": 58,
+        "image_color": "#111111",
+        "image_align": "left",
+        "image_valign": "center"
       },
-      "border": {
-        "color": "#111111",
-        "width": 35,
-        "alpha": 1.0
-      },
-      "clip": {
-        "transform_y": -0.72
+      "line2": {
+        "box": [80, 245, 1000, 380],
+        "max_chars": 11,
+        "image_font_size": 76,
+        "min_image_font_size": 56,
+        "image_color": "#00E846",
+        "image_stroke_color": "#111111",
+        "image_stroke_width": 9,
+        "image_align": "center",
+        "image_valign": "center"
       }
+    },
+    "channel": {
+      "font_path": "assets/fonts/Jua-Regular.ttf",
+      "suffix": "",
+      "box": [0, 1515, 1080, 1610],
+      "image_font_size": 72,
+      "min_image_font_size": 52,
+      "image_color": "#111111",
+      "image_align": "center",
+      "image_valign": "center"
     },
     "point": {
       "font": "Montserrat",

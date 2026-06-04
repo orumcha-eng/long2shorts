@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -18,13 +19,20 @@ DEFAULT_CHUNK_SECONDS = 600
 TRANSCRIBE_MODEL = "whisper-1"
 TRANSCRIBE_LANGUAGE = "ko"
 TRANSCRIBE_PROMPT = (
-    "This is Korean movie or drama dialogue. Preserve Korean wording, names, slang, and tense. "
+    "This is Korean YouTube variety, celebrity talk, movie, or drama dialogue. "
+    "Preserve Korean wording, names, slang, audible speaker turns, laughter, and tense. "
     "Return faithful timestamps for dialogue and narration."
 )
 
 
+def configure_stdout() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze a long-form movie/drama video into transcript chunks.")
+    parser = argparse.ArgumentParser(description="Analyze a long-form video into transcript chunks.")
     parser.add_argument("--source-video", type=Path, required=True, help="Source video path.")
     parser.add_argument(
         "--output-dir",
@@ -175,6 +183,7 @@ def write_metadata(
 
 
 def main() -> None:
+    configure_stdout()
     args = build_parser().parse_args()
     source_video = args.source_video.resolve()
     if not source_video.exists():
@@ -206,6 +215,13 @@ def main() -> None:
             flush=True,
         )
 
+        if not args.skip_transcribe and transcript_output.exists():
+            print(f"[analyze] transcript exists -> {transcript_output.name}", flush=True)
+            with open(transcript_output, "r", encoding="utf-8") as f:
+                record = json.load(f)
+            chunk_records.append(record)
+            continue
+
         if not audio_output.exists():
             print(f"[analyze] extracting audio -> {audio_output.name}", flush=True)
             extract_audio_chunk(source_video, start_sec, chunk_duration, audio_output)
@@ -215,14 +231,9 @@ def main() -> None:
         if args.skip_transcribe:
             continue
 
-        if transcript_output.exists():
-            print(f"[analyze] transcript exists -> {transcript_output.name}", flush=True)
-            with open(transcript_output, "r", encoding="utf-8") as f:
-                record = json.load(f)
-        else:
-            print(f"[analyze] transcribing -> {transcript_output.name}", flush=True)
-            record = transcribe_chunk(client, audio_output, transcript_output, start_sec)
-            print(f"[analyze] transcribed -> {transcript_output.name}", flush=True)
+        print(f"[analyze] transcribing -> {transcript_output.name}", flush=True)
+        record = transcribe_chunk(client, audio_output, transcript_output, start_sec)
+        print(f"[analyze] transcribed -> {transcript_output.name}", flush=True)
         chunk_records.append(record)
 
     write_metadata(source_video, output_dir, duration_sec, chunk_seconds, max_chunks, requested_max)

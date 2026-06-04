@@ -5,6 +5,7 @@ __pycache__/
 
 analysis/
 generated_audio/
+generated_text_overlays/
 
 *.mp3
 *.mp4

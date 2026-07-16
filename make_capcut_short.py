@@ -6,9 +6,10 @@ import uuid
 from pathlib import Path
 
 import pycapcut as cc
-from dotenv import load_dotenv
 from openai import OpenAI
 from pymediainfo import MediaInfo
+
+from env_loader import format_checked_env_paths, load_project_env
 
 
 DRAFT_ROOT = Path(r"C:\Users\user\AppData\Local\CapCut\User Data\Projects\com.lveditor.draft")
@@ -16,7 +17,6 @@ ROOT_META_PATH = DRAFT_ROOT / "root_meta_info.json"
 SOURCE_VIDEO = Path(r"C:\Users\user\Downloads\final_longform_1771901754.mp4")
 DRAFT_NAME = "codex_short_poc_02"
 BASE_DIR = Path(__file__).resolve().parent
-SHORTS_ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 AUDIO_CACHE_DIR = BASE_DIR / "generated_audio"
 TTS_VOICE = "onyx"
 TTS_SPEED = 1.2
@@ -66,10 +66,10 @@ def load_duration_us(path: Path) -> int:
 
 
 def get_openai_client() -> OpenAI:
-    load_dotenv(SHORTS_ENV_PATH)
+    load_project_env()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(f"OPENAI_API_KEY not found in {SHORTS_ENV_PATH}")
+        raise RuntimeError(f"OPENAI_API_KEY not found. Checked: {format_checked_env_paths()}")
     return OpenAI(api_key=api_key)
 
 

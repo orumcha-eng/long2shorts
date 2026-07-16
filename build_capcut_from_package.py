@@ -10,21 +10,22 @@ from pathlib import Path
 from typing import Any
 
 import pycapcut as cc
-from dotenv import load_dotenv
 from openai import OpenAI
 from PIL import Image, ImageColor, ImageDraw, ImageFont
 from pymediainfo import MediaInfo
+
+from env_loader import format_checked_env_paths, load_project_env
 
 
 DRAFT_ROOT = Path(r"C:\Users\user\AppData\Local\CapCut\User Data\Projects\com.lveditor.draft")
 ROOT_META_PATH = DRAFT_ROOT / "root_meta_info.json"
 BASE_DIR = Path(__file__).resolve().parent
-SHORTS_ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 AUDIO_CACHE_DIR = BASE_DIR / "generated_audio"
 TEXT_OVERLAY_CACHE_DIR = BASE_DIR / "generated_text_overlays"
 FONT_DIR = BASE_DIR / "assets" / "fonts"
-DEFAULT_JUA_FONT = FONT_DIR / "Jua-Regular.ttf"
-TEXT_OVERLAY_RENDER_VERSION = 2
+DEFAULT_OVERLAY_FONT = Path(r"C:\Windows\Fonts\Pretendard-ExtraBold.ttf")
+LEGACY_JUA_FONT = FONT_DIR / "Jua-Regular.ttf"
+TEXT_OVERLAY_RENDER_VERSION = 4
 REFERENCE_CAPCUT_FONT_ID = "7577600442964725008"
 REFERENCE_CAPCUT_FONT_PATH = Path(
     r"C:\Users\user\AppData\Local\CapCut\User Data\Cache\effect"
@@ -63,7 +64,7 @@ TITLE_LINE2_IMAGE_COLOR = "#00E846"
 TITLE_LINE2_IMAGE_STROKE_COLOR = "#111111"
 TITLE_LINE2_IMAGE_STROKE_WIDTH = 9
 TITLE_LINE2_IMAGE_BOX = (80, 245, 1000, 380)
-TITLE_LINE2_IMAGE_MAX_CHARS = 11
+TITLE_LINE2_IMAGE_MAX_CHARS = 14
 TITLE_LINE1_CAPCUT_X = 0.23809523809523817
 TITLE_LINE1_CAPCUT_Y = 0.8806584362139918
 TITLE_LINE2_CAPCUT_X = 0.04395604395604402
@@ -105,6 +106,9 @@ TITLE_PHRASE_REPLACEMENTS = (
 POINT_SIZE = 10.0
 POINT_Y = 0.1
 POINT_FONT = "Montserrat"
+POINT_CAPCUT_COLOR = "#F0FF00"
+POINT_CAPCUT_STROKE = "#000000"
+POINT_CAPCUT_STROKE_WIDTH = 0.06
 CHANNEL_SIZE = 5.6
 CHANNEL_Y = 0.88
 CHANNEL_FONT = "Montserrat"
@@ -143,10 +147,10 @@ def load_duration_us(path: Path) -> int:
 
 
 def get_openai_client() -> OpenAI:
-    load_dotenv(SHORTS_ENV_PATH)
+    load_project_env()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(f"OPENAI_API_KEY not found in {SHORTS_ENV_PATH}")
+        raise RuntimeError(f"OPENAI_API_KEY not found. Checked: {format_checked_env_paths()}")
     return OpenAI(api_key=api_key)
 
 
@@ -552,9 +556,15 @@ def collect_text_patches(
     content_patch = safe_dict(config.get("content_patch"))
 
     if material_patch:
-        material_patches[segment.material_id] = material_patch
+        material_patches[segment.material_id] = deep_merge(
+            material_patches.get(segment.material_id, {}),
+            material_patch,
+        )
     if content_patch:
-        content_patches[segment.material_id] = content_patch
+        content_patches[segment.material_id] = deep_merge(
+            content_patches.get(segment.material_id, {}),
+            content_patch,
+        )
 
 
 def apply_text_material_patches(
@@ -739,7 +749,7 @@ def resolve_template_image_path(config: dict[str, Any], explicit_path: Path | No
     return None
 
 
-def resolve_overlay_font_path(config: dict[str, Any], fallback: Path = DEFAULT_JUA_FONT) -> Path:
+def resolve_overlay_font_path(config: dict[str, Any], fallback: Path = DEFAULT_OVERLAY_FONT) -> Path:
     for value in (
         config.get("font_path"),
         config.get("font_file"),
@@ -751,6 +761,10 @@ def resolve_overlay_font_path(config: dict[str, Any], fallback: Path = DEFAULT_J
 
     for candidate in (
         fallback,
+        FONT_DIR / "Pretendard-ExtraBold.ttf",
+        Path(r"C:\Windows\Fonts\Pretendard-ExtraBold.ttf"),
+        Path(r"C:\Windows\Fonts\Pretendard-Bold.ttf"),
+        LEGACY_JUA_FONT,
         FONT_DIR / "BMJUA.ttf",
         FONT_DIR / "BMJUA_ttf.ttf",
         FONT_DIR / "Jua-Regular.ttf",
@@ -1418,7 +1432,7 @@ def main() -> None:
     channel_name = infer_channel_name(package_path, package, args.channel_name)
     channel_text = format_channel_text(channel_name, channel_config)
     channel_enabled = as_bool(channel_config.get("enabled"), True)
-    text_overlay_enabled = as_bool(text_overlay_config.get("enabled"), False)
+    text_overlay_enabled = as_bool(text_overlay_config.get("enabled"), True)
 
     draft_folder = cc.DraftFolder(str(DRAFT_ROOT))
     if draft_folder.has_draft(draft_name):
@@ -1631,6 +1645,24 @@ def main() -> None:
             fallback_clip=point_default_clip,
         )
         script.add_segment(caption_segment, track_name="point")
+        caption_style = safe_dict(caption_config.get("style"))
+        caption_border = safe_dict(caption_config.get("border"))
+        point_text_overrides = deep_merge(
+            {
+                "font_size": positive_float(caption_style.get("size"), POINT_SIZE),
+                "stroke_width": positive_float(caption_border.get("stroke_width"), POINT_CAPCUT_STROKE_WIDTH),
+            },
+            safe_dict(caption_config.get("text")),
+        )
+        register_reference_capcut_text_patch(
+            material_patches,
+            content_patches,
+            caption_segment,
+            str(caption["text"]),
+            fill_color=resolve_hex_color(caption_style.get("color"), POINT_CAPCUT_COLOR),
+            stroke_color=resolve_hex_color(caption_border.get("color"), POINT_CAPCUT_STROKE),
+            overrides=point_text_overrides,
+        )
         collect_text_patches(material_patches, content_patches, caption_segment, caption_config)
 
     script.save()

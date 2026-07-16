@@ -8,12 +8,12 @@ import sys
 import unicodedata
 from typing import Optional
 
-from dotenv import load_dotenv
 from openai import OpenAI
+
+from env_loader import format_checked_env_paths, load_project_env
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 
 ANALYSIS_DIR = BASE_DIR / "analysis" / "jiunsudaetong1"
 TRANSCRIPTS_DIR = ANALYSIS_DIR / "transcripts"
@@ -24,11 +24,22 @@ MOVIE_INFO: Optional[dict] = None
 YOUTUBE_CONTEXT: Optional[dict] = None
 REFERENCE_STYLE_CONTEXT = ""
 REFERENCE_STYLE_EXAMPLES: list[dict] = []
+BENCHMARK_PROFILE_CONTEXT = ""
+BENCHMARK_PROFILE: dict = {}
+LEARNING_RULE_CONTEXT = ""
+LEARNING_RULE: dict = {}
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_TEMPERATURE = 0.2
 CHUNK_TOP_K = 8
 FINAL_TOP_K = 10
 MAX_RETRIES = 3
+OPENAI_REQUEST_TIMEOUT_SEC = 120.0
+OPENAI_SDK_MAX_RETRIES = 1
+BENCHMARK_CHUNK_TOP_K = 5
+BENCHMARK_FINAL_TOP_K = 8
+BENCHMARK_LOCAL_MAX_COMPLETION_TOKENS = 4_800
+GLOBAL_MAX_COMPLETION_TOKENS = 2_400
+PACKAGING_MAX_COMPLETION_TOKENS = 4_800
 WIDE_WINDOW_GROUP_SIZE = 2
 TARGET_DURATION_MIN = 32.0
 TARGET_DURATION_MAX = 58.0
@@ -122,6 +133,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional benchmark-only reverse-engineered reference shorts JSON. Not used by the GUI/default production flow.",
     )
+    parser.add_argument(
+        "--benchmark-profile",
+        type=Path,
+        default=None,
+        help="Optional genre scoring profile used to rank production candidates."
+    )
+    parser.add_argument(
+        "--learning-rule",
+        type=Path,
+        default=None,
+        help="Optional active orchestration rule that must influence candidate selection and packaging.",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument(
         "--no-wide-windows",
@@ -138,8 +161,10 @@ def configure_runtime(
     movie_info_path: Optional[Path],
     youtube_context_path: Optional[Path],
     reference_style_path: Optional[Path] = None,
+    benchmark_profile_path: Optional[Path] = None,
+    learning_rule_path: Optional[Path] = None,
 ) -> None:
-    global ANALYSIS_DIR, TRANSCRIPTS_DIR, MERGED_TRANSCRIPT_PATH, OUTPUT_DIR, SOURCE_TITLE, MOVIE_INFO, YOUTUBE_CONTEXT, REFERENCE_STYLE_CONTEXT, REFERENCE_STYLE_EXAMPLES
+    global ANALYSIS_DIR, TRANSCRIPTS_DIR, MERGED_TRANSCRIPT_PATH, OUTPUT_DIR, SOURCE_TITLE, MOVIE_INFO, YOUTUBE_CONTEXT, REFERENCE_STYLE_CONTEXT, REFERENCE_STYLE_EXAMPLES, BENCHMARK_PROFILE_CONTEXT, BENCHMARK_PROFILE, LEARNING_RULE_CONTEXT, LEARNING_RULE
     ANALYSIS_DIR = analysis_dir
     TRANSCRIPTS_DIR = ANALYSIS_DIR / "transcripts"
     MERGED_TRANSCRIPT_PATH = ANALYSIS_DIR / "merged" / "merged_transcript.json"
@@ -157,6 +182,16 @@ def configure_runtime(
         YOUTUBE_CONTEXT = None
     REFERENCE_STYLE_EXAMPLES = load_reference_style_examples(reference_style_path)
     REFERENCE_STYLE_CONTEXT = format_reference_style_examples(REFERENCE_STYLE_EXAMPLES)
+    BENCHMARK_PROFILE = load_benchmark_profile(benchmark_profile_path)
+    BENCHMARK_PROFILE_CONTEXT = format_benchmark_profile(BENCHMARK_PROFILE)
+    LEARNING_RULE = load_learning_rule(learning_rule_path)
+    LEARNING_RULE_CONTEXT = format_learning_rule(LEARNING_RULE)
+    if BENCHMARK_PROFILE:
+        REFERENCE_STYLE_CONTEXT = "\n\n".join(
+            value
+            for value in [REFERENCE_STYLE_CONTEXT, BENCHMARK_PROFILE_CONTEXT]
+            if value
+        )
 
 
 LOCAL_EXTRACTION_SYSTEM = """You are a senior Korean shorts editor for YouTube variety, celebrity talk, vlog, and movie/drama sources.
@@ -350,11 +385,15 @@ Return JSON only.
 
 
 def load_client() -> OpenAI:
-    load_dotenv(ENV_PATH)
+    load_project_env()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(f"OPENAI_API_KEY not found in {ENV_PATH}")
-    return OpenAI(api_key=api_key)
+        raise RuntimeError(f"OPENAI_API_KEY not found. Checked: {format_checked_env_paths()}")
+    return OpenAI(
+        api_key=api_key,
+        timeout=OPENAI_REQUEST_TIMEOUT_SEC,
+        max_retries=OPENAI_SDK_MAX_RETRIES,
+    )
 
 
 def ensure_output_dirs() -> None:
@@ -380,16 +419,20 @@ def model_json(
     system_prompt: str,
     user_prompt: str,
     temperature: float = DEFAULT_TEMPERATURE,
+    max_completion_tokens: int | None = None,
 ) -> dict:
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        response_format={"type": "json_object"},
-        messages=[
+    request_kwargs = {
+        "model": model,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-    )
+    }
+    if max_completion_tokens is not None:
+        request_kwargs["max_completion_tokens"] = max_completion_tokens
+    response = client.chat.completions.create(**request_kwargs)
     return parse_json_response(response.choices[0].message.content or "{}")
 
 
@@ -619,8 +662,18 @@ def validate_local_result(result: dict) -> tuple[bool, str]:
             end = float(cand.get("candidate_end"))
         except Exception:
             return False, f"Candidate {idx} has invalid score/start/end."
-        if score < 60 or score > 100:
-            return False, f"Candidate {idx} score must be 60 to 100."
+        scorecard, message = normalize_genre_scorecard(cand.get("genre_scorecard"))
+        if message:
+            return False, f"Candidate {idx} {message}"
+        if scorecard:
+            cand["genre_scorecard"] = scorecard
+            # The scorecard is the source of truth. Models sometimes make a
+            # harmless arithmetic error in the redundant top-level score field.
+            score = scorecard["total"]
+            cand["score"] = score
+        minimum_local_score = 0 if BENCHMARK_PROFILE else 60
+        if score < minimum_local_score or score > 100:
+            return False, f"Candidate {idx} score must be {minimum_local_score} to 100."
         if end <= start:
             return False, f"Candidate {idx} end must be greater than start."
 
@@ -724,8 +777,16 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         duration = float(result.get("target_duration_sec"))
     except Exception:
         duration = clip_total or 0.0
-    if score < 70 or score > 100:
-        return False, "score must be 70 to 100."
+    scorecard, message = normalize_genre_scorecard(result.get("genre_scorecard"))
+    if message:
+        return False, message
+    if scorecard:
+        result["genre_scorecard"] = scorecard
+        score = scorecard["total"]
+        result["score"] = score
+    minimum_final_score = 0 if BENCHMARK_PROFILE else 70
+    if score < minimum_final_score or score > 100:
+        return False, f"score must be {minimum_final_score} to 100."
 
     if clip_total is not None and clip_total > 0:
         duration = clip_total
@@ -834,11 +895,19 @@ def model_json_validated(
     user_prompt: str,
     validator,
     temperature: float = DEFAULT_TEMPERATURE,
+    max_completion_tokens: int | None = None,
 ) -> dict:
     prompt = user_prompt
     last_error = ""
     for _ in range(MAX_RETRIES):
-        result = model_json(client, model, system_prompt, prompt, temperature=temperature)
+        result = model_json(
+            client,
+            model,
+            system_prompt,
+            prompt,
+            temperature=temperature,
+            max_completion_tokens=max_completion_tokens,
+        )
         ok, message = validator(result)
         if ok:
             return result
@@ -1546,6 +1615,181 @@ def load_reference_style_examples(path: Optional[Path]) -> list[dict]:
     return examples[:4]
 
 
+def load_benchmark_profile(path: Optional[Path]) -> dict:
+    if not path or not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    return raw if isinstance(raw, dict) else {}
+
+
+def load_learning_rule(path: Optional[Path]) -> dict:
+    if not path or not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict) or not raw.get("rule_id"):
+        return {}
+    return raw
+
+
+def format_learning_rule(rule: dict) -> str:
+    if not rule:
+        return ""
+    constraints = [str(item).strip() for item in rule.get("constraints", []) or [] if str(item).strip()]
+    lines = [
+        "Active orchestration learning rule:",
+        f"- rule_id={rule.get('rule_id', '')}; mode={rule.get('mode', '')}; kind={rule.get('rule_kind', '')}",
+        f"- change_note={rule.get('change_note', '')}",
+        "- This rule is mandatory for the current run. Change only what its constraints specify; retain source truth and standalone clarity.",
+    ]
+    for constraint in constraints:
+        lines.append(f"- required constraint: {constraint}")
+    return "\n".join(lines)
+
+
+def format_benchmark_profile(profile: dict) -> str:
+    if not profile:
+        return ""
+
+    score = profile.get("score") if isinstance(profile.get("score"), dict) else {}
+    lines = [
+        "Genre benchmark profile:",
+        f"- profile={profile.get('profile_id', '')}; scope={profile.get('scope', '')}",
+        "- Treat this profile as a scoring rubric. Never copy its creators, characters, phrases, or jokes into another source.",
+    ]
+    for dimension in score.get("dimensions", []) or []:
+        if not isinstance(dimension, dict):
+            continue
+        lines.append(
+            f"- score {dimension.get('id', '')} ({dimension.get('weight', 0)}): {dimension.get('question', '')}"
+        )
+    for penalty in score.get("penalties", []) or []:
+        if not isinstance(penalty, dict):
+            continue
+        lines.append(
+            f"- penalty {penalty.get('id', '')} (up to -{penalty.get('max_deduction', 0)}): {penalty.get('rule', '')}"
+        )
+    for rule in profile.get("selection_rules", []) or []:
+        lines.append(f"- selection rule: {rule}")
+    policy = profile.get("decision_policy") if isinstance(profile.get("decision_policy"), dict) else {}
+    if policy:
+        lines.append(
+            "- decision policy: "
+            + "; ".join(f"{key}={value}" for key, value in policy.items())
+        )
+    return "\n".join(lines)
+
+
+def benchmark_score_config() -> tuple[str, list[dict], dict[str, dict], int, int]:
+    if not BENCHMARK_PROFILE:
+        return "", [], {}, 0, 0
+    score = BENCHMARK_PROFILE.get("score") if isinstance(BENCHMARK_PROFILE.get("score"), dict) else {}
+    dimensions = [
+        item
+        for item in score.get("dimensions", []) or []
+        if isinstance(item, dict) and item.get("id") and int(item.get("weight", 0) or 0) > 0
+    ]
+    penalties = {
+        str(item.get("id")): item
+        for item in score.get("penalties", []) or []
+        if isinstance(item, dict) and item.get("id")
+    }
+    pass_score = int(score.get("pass_score", 78) or 78)
+    review_score = int(score.get("review_score", 68) or 68)
+    return str(BENCHMARK_PROFILE.get("profile_id", "")), dimensions, penalties, pass_score, review_score
+
+
+def benchmark_chunk_top_k() -> int:
+    return BENCHMARK_CHUNK_TOP_K if BENCHMARK_PROFILE else CHUNK_TOP_K
+
+
+def benchmark_final_top_k() -> int:
+    return BENCHMARK_FINAL_TOP_K if BENCHMARK_PROFILE else FINAL_TOP_K
+
+
+def normalize_genre_scorecard(value: object) -> tuple[dict | None, str]:
+    profile_id, dimensions, penalties_by_id, pass_score, review_score = benchmark_score_config()
+    if not profile_id:
+        return None, ""
+    if not isinstance(value, dict):
+        return None, "Missing genre_scorecard for the active benchmark profile."
+    if str(value.get("profile_id", "")) != profile_id:
+        return None, "genre_scorecard profile_id does not match the active benchmark profile."
+
+    raw_dimensions = value.get("dimensions")
+    if not isinstance(raw_dimensions, list):
+        return None, "genre_scorecard.dimensions must be a list."
+    expected_ids = [str(item["id"]) for item in dimensions]
+    found: dict[str, dict] = {}
+    for item in raw_dimensions:
+        if not isinstance(item, dict):
+            return None, "genre_scorecard contains a non-object dimension."
+        dimension_id = str(item.get("id", ""))
+        if dimension_id not in expected_ids or dimension_id in found:
+            return None, "genre_scorecard dimensions must contain each configured id exactly once."
+        max_score = int(next(spec["weight"] for spec in dimensions if str(spec["id"]) == dimension_id))
+        try:
+            item_score = int(item.get("score"))
+        except Exception:
+            return None, f"genre_scorecard {dimension_id} score must be an integer."
+        if not 0 <= item_score <= max_score:
+            return None, f"genre_scorecard {dimension_id} score must be 0 to {max_score}."
+        reason = str(item.get("reason", "")).strip()
+        if not reason:
+            return None, f"genre_scorecard {dimension_id} requires a reason."
+        found[dimension_id] = {"id": dimension_id, "score": item_score, "max_score": max_score, "reason": reason}
+    if set(found) != set(expected_ids):
+        return None, "genre_scorecard is missing one or more configured dimensions."
+
+    raw_penalties = value.get("penalties", [])
+    if not isinstance(raw_penalties, list):
+        return None, "genre_scorecard.penalties must be a list."
+    normalized_penalties = []
+    seen_penalty_ids = set()
+    for item in raw_penalties:
+        if not isinstance(item, dict):
+            return None, "genre_scorecard contains a non-object penalty."
+        penalty_id = str(item.get("id", ""))
+        if penalty_id not in penalties_by_id or penalty_id in seen_penalty_ids:
+            return None, "genre_scorecard penalty ids must come from the active profile and be unique."
+        try:
+            deduction = int(item.get("deduction"))
+        except Exception:
+            return None, f"genre_scorecard {penalty_id} deduction must be an integer."
+        max_deduction = int(penalties_by_id[penalty_id].get("max_deduction", 0) or 0)
+        if not 1 <= deduction <= max_deduction:
+            return None, f"genre_scorecard {penalty_id} deduction must be 1 to {max_deduction}."
+        reason = str(item.get("reason", "")).strip()
+        if not reason:
+            return None, f"genre_scorecard {penalty_id} requires a reason."
+        normalized_penalties.append({"id": penalty_id, "deduction": deduction, "reason": reason})
+        seen_penalty_ids.add(penalty_id)
+
+    dimension_total = sum(item["score"] for item in found.values())
+    penalty_total = sum(item["deduction"] for item in normalized_penalties)
+    total = max(0, dimension_total - penalty_total)
+    # A large context/crop/payoff penalty should never pass straight to rendering,
+    # even when the remaining dimensions produce a high total.
+    has_blocking_penalty = any(item["deduction"] > 5 for item in normalized_penalties)
+    decision = (
+        "auto_render"
+        if total >= pass_score and not has_blocking_penalty
+        else "review"
+        if total >= review_score
+        else "reject"
+    )
+    return {
+        "profile_id": profile_id,
+        "total": total,
+        "dimension_total": dimension_total,
+        "penalty_total": penalty_total,
+        "dimensions": [found[item_id] for item_id in expected_ids],
+        "penalties": normalized_penalties,
+        "decision": decision,
+    }, ""
+
+
 def format_reference_style_examples(
     examples: list[dict],
     start_sec: Optional[float] = None,
@@ -1899,6 +2143,7 @@ def extract_candidate_context(segments: list[dict], candidate: dict) -> list[dic
 
 
 def build_local_prompt(chunk: dict) -> str:
+    candidate_limit = benchmark_chunk_top_k()
     wide_window_extra_rule = ""
     if str(chunk.get("chunk_id", "")).startswith("wide_"):
         wide_window_extra_rule = """
@@ -1923,13 +2168,16 @@ Wide-window cross-chunk rule:
 Chunk id: {chunk['chunk_id']}
 Chunk range: {chunk['start_sec']:.3f} to {chunk['end_sec']:.3f}
 {format_reference_style_examples(REFERENCE_STYLE_EXAMPLES, chunk['start_sec'], chunk['end_sec'])}
+{BENCHMARK_PROFILE_CONTEXT}
+{LEARNING_RULE_CONTEXT}
 {format_anchor_hints_for_prompt(chunk['segments'])}
 {wide_window_extra_rule}
 
 Task:
-- Find the top {CHUNK_TOP_K} local shorts candidates from this chunk only.
+- Find the top {candidate_limit} local shorts candidates from this chunk only.
 - Each candidate must be a distinct source scene or variety bit with a distinct payoff beat.
 - If benchmark reference calibration is explicitly supplied, use it only as a scoring/debugging lens; do not copy an exact answer skeleton unless the source evidence independently supports that same thread.
+- When an Active orchestration learning rule is present, apply every required constraint to candidate selection, hook order, and clip_blueprint. Do not claim the rule was applied without source evidence.
 - Before choosing candidates, mentally separate the transcript into answerable threads, not isolated funny lines.
 - A thread is a repeated tease, object/style motif, promise, accusation, misunderstanding, calculation, process, challenge, transformation, or emotional question that can be named in one title.
 - The candidate should represent the whole answer thread that a human could score against a timeline answer.
@@ -1988,7 +2236,9 @@ Task:
 - Do not output one long unbroken conversation block; even a continuous exchange should be split into hook, reaction, bridge, correction, and payoff cuts.
 - Split reaction, pause, stare, comeback, and reveal into separate cuts instead of using one long conversation block.
 - Use Korean for descriptive text fields.
-- If the chunk does not truly contain {CHUNK_TOP_K} strong moments, return fewer.
+- When a Genre benchmark profile is present, score every configured dimension from 0 to its listed weight and explain each score in one short Korean sentence.
+- Use a penalty only when the listed risk is present in source evidence. The candidate score must equal the dimension total minus deductions.
+- If the chunk does not truly contain {candidate_limit} strong moments, return fewer.
 
 Return JSON with this exact shape:
 {{
@@ -1998,6 +2248,15 @@ Return JSON with this exact shape:
       "candidate_id": "{chunk['chunk_id']}_cand_01",
       "chunk_id": "{chunk['chunk_id']}",
       "score": 82,
+      "genre_scorecard": {{
+        "profile_id": "active benchmark profile id when supplied",
+        "dimensions": [
+          {{"id": "configured dimension id", "score": 0, "reason": "Korean evidence-based reason"}}
+        ],
+        "penalties": [
+          {{"id": "configured penalty id", "deduction": 1, "reason": "Korean evidence-based reason"}}
+        ]
+      }},
       "hook_frame_name": "시장형 훅 프레임",
       "hook_frame_reason": "이 장면이 어떤 시청자 약속으로 팔리는지 설명",
       "viewer_promise": "시청자가 이 쇼츠에서 기대하는 보상이나 반전",
@@ -2058,6 +2317,7 @@ Transcript:
 
 
 def build_global_prompt(local_candidates: list[dict]) -> str:
+    final_limit = benchmark_final_top_k()
     compact = []
     for cand in local_candidates:
         compact.append(
@@ -2065,6 +2325,7 @@ def build_global_prompt(local_candidates: list[dict]) -> str:
                 "candidate_id": cand["candidate_id"],
                 "chunk_id": cand["chunk_id"],
                 "score": cand["score"],
+                "genre_scorecard": cand.get("genre_scorecard", {}),
                 "hook_frame_name": cand.get("hook_frame_name", ""),
                 "hook_frame_reason": cand.get("hook_frame_reason", ""),
                 "viewer_promise": cand.get("viewer_promise", ""),
@@ -2094,11 +2355,13 @@ def build_global_prompt(local_candidates: list[dict]) -> str:
 {format_youtube_context_for_prompt()}
 You are selecting the best final shorts from the candidate pool below.
 {REFERENCE_STYLE_CONTEXT}
+{LEARNING_RULE_CONTEXT}
 
 Rules:
-- select up to {FINAL_TOP_K}
+- select up to {final_limit}
 - prioritize strongest view-driving candidates first
 - if benchmark reference calibration examples are explicitly supplied, use them to audit title intention and timeline similarity; do not let them override source-evidence quality in normal selection
+- when an Active orchestration learning rule is present, prefer candidates that visibly satisfy its required constraints over otherwise similar candidates
 - each selected short must use genuinely distinct source footage
 - keep the bar high
 - prioritize candidates that can become a satisfying short with at least 5 cuts
@@ -2112,6 +2375,7 @@ Rules:
 - do not bury brief high-signal anchors such as money, calculation mistakes, smoking/ad/promotion, public embarrassment, refusal, accusation, or sudden group reaction just because another ordinary conversation is longer
 - demote candidates that include a social-risk line but title/core_event the next adjacent ordinary topic instead of the risk itself
 - for Korean celebrity YouTube/talk sources, value source-specific moments that have a clear trigger, interaction, change, and payoff even when the stakes are low
+- when a Genre benchmark profile is present, keep candidates with a higher genre_scorecard total ahead of otherwise similar candidates and demote genre_scorecard decisions of review or reject
 - for those sources, prefer candidates that can become a title pair like "trigger/person" plus "reaction/payoff"
 - do not bury a candidate just because the transcript is quiet if comments repeatedly call out a visual subject or side character
 - a lower local score candidate with a strong recurring audience topic and timestamp evidence should usually be selected
@@ -2163,6 +2427,8 @@ def build_packaging_prompt(candidate: dict, context_segments: list[dict], rank: 
 Final rank: {rank}
 Target short id: {short_id}
 {format_reference_style_examples(REFERENCE_STYLE_EXAMPLES, candidate.get('candidate_start'), candidate.get('candidate_end'))}
+{BENCHMARK_PROFILE_CONTEXT}
+{LEARNING_RULE_CONTEXT}
 
 Candidate summary:
 {json.dumps(candidate, ensure_ascii=False, indent=2)}
@@ -2174,6 +2440,7 @@ Candidate clip blueprint total duration: {blueprint_total:.1f} seconds
 
 Task:
 - Create a final shorts package for CapCut rough-cut generation.
+- When an Active orchestration learning rule is present, preserve its required change in the final source_clips. Do not silently revert to the previous default edit structure.
 - If this package is driven by audience comments about a visual subject, make that subject visible in the title, hook, and clip purposes.
 - The final short often works around {TARGET_DURATION_MIN:.0f} to {TARGET_DURATION_MAX:.0f} seconds, but story flow matters more than this preference.
 - It must be reconstructable into at least {MIN_CLIP_COUNT} cuts.
@@ -2215,6 +2482,7 @@ Task:
 - for Korean celebrity YouTube/talk, line 1 should name the trigger, person, object, or situation; line 2 should name the reaction, reversal, or payoff
 - do not reuse titles or motifs from reference shorts unless the current source independently contains them
 - do not use fixed title templates; title wording must come from the current source
+- upload_title must be one copy-ready Korean YouTube Shorts upload title that combines the hook and payoff naturally; include 1 to 3 compact hashtags only when useful
 - selection_pitch must explain in one Korean sentence why a human would want to click this short
 - evaluation_notes must explain how title intention, semantic meaning, and source clip structure line up for this candidate
 - timeline_answerability should be high only when a human could match this package to one clear gold timeline answer
@@ -2233,15 +2501,26 @@ Task:
 - do not repeat the exact meaning of the 2-line title inside point captions
 - help the user choose this short before making a CapCut draft
 - prefer ending on reaction rather than explanation when possible
+- when a Genre benchmark profile is present, independently score the final source_clips with every configured dimension and include a genre_scorecard; set score to its dimension total minus deductions
 
 Return JSON with this exact shape:
 {{
   "short_id": "{short_id}",
   "score": 88,
+  "genre_scorecard": {{
+    "profile_id": "active benchmark profile id when supplied",
+    "dimensions": [
+      {{"id": "configured dimension id", "score": 0, "reason": "Korean evidence-based reason"}}
+    ],
+    "penalties": [
+      {{"id": "configured penalty id", "deduction": 1, "reason": "Korean evidence-based reason"}}
+    ]
+  }},
   "core_event": "한 문장 요약",
   "emotion_arc": "감정 흐름",
   "title_line1": "제목 1줄",
   "title_line2": "제목 2줄",
+  "upload_title": "업로드용 제목 한 줄",
   "selection_pitch": "이 쇼츠가 왜 볼만한지 한 줄 설명",
   "thread_key": "반복 장난/약속/오해/계산 등 한 줄 식별자",
   "thread_intention": "이 후보가 걸고 있는 시청자 약속과 최종 페이오프",
@@ -2330,7 +2609,7 @@ def run_local_extraction(client: OpenAI, model: str, chunk_records: list[dict], 
     for index, chunk in enumerate(chunk_records, start=1):
         print(f"[package] local extraction {index}/{total} -> {chunk['chunk_id']}", flush=True)
         out_path = OUTPUT_DIR / "local" / f"{chunk['chunk_id']}.json"
-        if out_path.exists() and not force:
+        if out_path.exists() and not force and not BENCHMARK_PROFILE and not LEARNING_RULE:
             print(f"[package] using cached local result -> {out_path.name}", flush=True)
             with open(out_path, "r", encoding="utf-8") as f:
                 result = json.load(f)
@@ -2342,6 +2621,9 @@ def run_local_extraction(client: OpenAI, model: str, chunk_records: list[dict], 
                 LOCAL_EXTRACTION_SYSTEM,
                 build_local_prompt(chunk),
                 validate_local_result,
+                max_completion_tokens=(
+                    BENCHMARK_LOCAL_MAX_COMPLETION_TOKENS if BENCHMARK_PROFILE else None
+                ),
             )
             save_json(out_path, result)
             print(f"[package] saved local candidates -> {out_path.name}", flush=True)
@@ -2353,7 +2635,7 @@ def run_local_extraction(client: OpenAI, model: str, chunk_records: list[dict], 
 
 def run_global_selection(client: OpenAI, model: str, local_candidates: list[dict], force: bool) -> dict:
     out_path = OUTPUT_DIR / "global" / "selected_candidates.json"
-    if out_path.exists() and not force:
+    if out_path.exists() and not force and not BENCHMARK_PROFILE and not LEARNING_RULE:
         print(f"[package] using cached global selection -> {out_path.name}", flush=True)
         with open(out_path, "r", encoding="utf-8") as f:
             result = json.load(f)
@@ -2365,6 +2647,7 @@ def run_global_selection(client: OpenAI, model: str, local_candidates: list[dict
             GLOBAL_RERANK_SYSTEM,
             build_global_prompt(local_candidates),
             validate_global_result,
+            max_completion_tokens=GLOBAL_MAX_COMPLETION_TOKENS,
         )
         save_json(out_path, result)
         print(f"[package] saved global selection -> {out_path.name}", flush=True)
@@ -2392,7 +2675,7 @@ def augment_selected_with_audience_topics(selected: list[dict], local_candidates
         missing.append((float(best_signal.get("signal_score", 0)), candidate, best_signal))
 
     for _score, candidate, signal in sorted(missing, key=lambda item: item[0], reverse=True):
-        if len(selected) >= FINAL_TOP_K:
+        if len(selected) >= benchmark_final_top_k():
             break
         rank = len(selected) + 1
         selected.append(
@@ -2445,7 +2728,7 @@ def run_final_packaging(
         if out_path.exists() and not force:
             with open(out_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if cached.get("candidate_id") == item["candidate_id"]:
+            if cached.get("candidate_id") == item["candidate_id"] and not BENCHMARK_PROFILE and not LEARNING_RULE:
                 print(f"[package] using cached final package -> {package_name}", flush=True)
                 result = cached
             else:
@@ -2458,6 +2741,7 @@ def run_final_packaging(
                 PACKAGING_SYSTEM,
                 build_packaging_prompt(candidate, context_segments, int(item["global_rank"])),
                 validate_final_result,
+                max_completion_tokens=PACKAGING_MAX_COMPLETION_TOKENS,
             )
         result["candidate_id"] = item["candidate_id"]
         result["global_rank"] = item["global_rank"]
@@ -2469,6 +2753,8 @@ def run_final_packaging(
                 result[key] = candidate.get(key)
         result["audience_topic_signal"] = candidate.get("audience_topic_signal", [])
         result["audience_topic_score"] = candidate.get("audience_topic_score", 0)
+        if LEARNING_RULE:
+            result["learning_rule"] = LEARNING_RULE
         ok, message = validate_final_result(result)
         if not ok:
             raise RuntimeError(f"Cached/generated final package failed validation: {message}")
@@ -2498,6 +2784,26 @@ def write_summary(final_packages: list[dict]) -> None:
         lines.append(f"- target_duration_sec: {pkg.get('target_duration_sec', '')}")
         lines.append(f"- source_clips_total_sec: {clip_total}")
         lines.append(f"- clip_count: {len(pkg.get('source_clips', []) or [])}")
+        scorecard = pkg.get("genre_scorecard") if isinstance(pkg.get("genre_scorecard"), dict) else {}
+        if scorecard:
+            lines.append(
+                f"- genre_scorecard: {scorecard.get('total', '')}/100 "
+                f"({scorecard.get('decision', '')})"
+            )
+            dimensions = [
+                f"{item.get('id', '')}={item.get('score', '')}/{item.get('max_score', '')}"
+                for item in scorecard.get("dimensions", []) or []
+                if isinstance(item, dict)
+            ]
+            if dimensions:
+                lines.append(f"- genre_dimensions: {', '.join(dimensions)}")
+            penalties = [
+                f"{item.get('id', '')}=-{item.get('deduction', '')}"
+                for item in scorecard.get("penalties", []) or []
+                if isinstance(item, dict)
+            ]
+            if penalties:
+                lines.append(f"- genre_penalties: {', '.join(penalties)}")
         if pkg.get("evaluation_notes"):
             lines.append(f"- evaluation_notes: {pkg.get('evaluation_notes', '')}")
         lines.append(f"- narration_count: {len(pkg.get('narration', []) or [])}")
@@ -2516,12 +2822,18 @@ def main() -> None:
         args.movie_info.resolve() if args.movie_info else None,
         args.youtube_context.resolve() if args.youtube_context else None,
         args.reference_style_path.resolve() if args.reference_style_path else None,
+        args.benchmark_profile.resolve() if args.benchmark_profile else None,
+        args.learning_rule.resolve() if args.learning_rule else None,
     )
 
     ensure_output_dirs()
     print(f"[package] analysis_dir={ANALYSIS_DIR}", flush=True)
     print(f"[package] source_title={SOURCE_TITLE}", flush=True)
     print(f"[package] model={args.model}", flush=True)
+    if BENCHMARK_PROFILE_CONTEXT:
+        print(f"[package] benchmark_profile={args.benchmark_profile}", flush=True)
+    if LEARNING_RULE_CONTEXT:
+        print(f"[package] learning_rule={args.learning_rule}", flush=True)
     if YOUTUBE_CONTEXT:
         fetched = (YOUTUBE_CONTEXT.get("comments") or {}).get("fetched_count", 0)
         moments = ((YOUTUBE_CONTEXT.get("comment_insights") or {}).get("timecode_moments") or [])
@@ -2535,7 +2847,7 @@ def main() -> None:
     print(f"[package] loaded merged_segments={len(merged_segments)}", flush=True)
 
     local_candidates = run_local_extraction(client, args.model, chunk_records, args.force)
-    anchor_seed_candidates = build_anchor_seed_candidates(chunk_records)
+    anchor_seed_candidates = [] if BENCHMARK_PROFILE else build_anchor_seed_candidates(chunk_records)
     if anchor_seed_candidates:
         existing_ids = {candidate.get("candidate_id") for candidate in local_candidates}
         new_seeds = [candidate for candidate in anchor_seed_candidates if candidate.get("candidate_id") not in existing_ids]
@@ -2554,7 +2866,7 @@ def main() -> None:
 
     local_candidates_by_id = {cand["candidate_id"]: cand for cand in local_candidates}
     aggregate_path = OUTPUT_DIR / "final" / "shorts_packages.json"
-    if aggregate_path.exists() and not args.force:
+    if aggregate_path.exists() and not args.force and not BENCHMARK_PROFILE and not LEARNING_RULE:
         print(f"[package] using cached aggregate packages -> {aggregate_path.name}", flush=True)
         with open(aggregate_path, "r", encoding="utf-8") as f:
             final_payload = json.load(f)
@@ -2572,6 +2884,11 @@ def main() -> None:
         final_payload = {
             "source_title": SOURCE_TITLE,
             "model": args.model,
+            "benchmark_profile": {
+                "profile_id": BENCHMARK_PROFILE.get("profile_id", ""),
+                "path": str(args.benchmark_profile) if args.benchmark_profile else "",
+            },
+            "learning_rule": LEARNING_RULE,
             "movie_info": MOVIE_INFO,
             "youtube_context": {
                 "source_url": YOUTUBE_CONTEXT.get("source_url", "") if YOUTUBE_CONTEXT else "",

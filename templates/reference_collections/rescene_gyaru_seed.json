@@ -1,0 +1,37 @@
+{
+  "collection_id": "rescene_gyaru_seed_v1",
+  "profile_path": "templates/benchmark_profiles/rescene_gyaru_variety.json",
+  "purpose": "Collect public long-form reference signals for a Korean variety shorts selection benchmark.",
+  "videos": [
+    {
+      "url": "https://www.youtube.com/watch?v=heifaIjlSUc",
+      "label": "origin_gyaru_posture",
+      "expected_engine": "style contrast -> teasing -> deadpan unexpected response -> reaction"
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=OrCOflk2QmQ",
+      "label": "geoje_part_1",
+      "expected_engine": "fish-out-of-water persona -> local relationship -> visible reactions"
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=SF29doLuBfc",
+      "label": "geoje_part_2",
+      "expected_engine": "running joke callback -> audience-facing consequence -> payoff"
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=bvUS-ri9nqQ",
+      "label": "gyaru_japanese_lesson",
+      "expected_engine": "persona -> language mismatch -> correction or reaction"
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=NS7tSrMrWsc",
+      "label": "dialect_day",
+      "expected_engine": "identity or dialect rule -> conversational collision -> reaction"
+    },
+    {
+      "url": "https://www.youtube.com/watch?v=JJBf0jCcfrQ",
+      "label": "seongsu_dialect_part_2",
+      "expected_engine": "natural relationship chemistry -> small mismatch -> memorable response"
+    }
+  ]
+}

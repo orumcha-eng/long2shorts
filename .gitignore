@@ -4,12 +4,25 @@ __pycache__/
 *.py[cod]
 
 analysis/
+downloads/
 generated_audio/
 generated_text_overlays/
+hitomi_downloaded_youtube/
 
 *.mp3
 *.mp4
+*.mkv
+*.mov
+*.webm
 *.wav
 *.m4a
+*.aac
+*.flac
+*.ogg
+*.opus
+*.part
 
 .env
+automation_config.json
+secrets/
+reference_channels.json

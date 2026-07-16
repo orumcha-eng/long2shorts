@@ -13,11 +13,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.request import Request, urlopen
 
-from dotenv import load_dotenv
+from env_loader import load_project_env
 
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 YOUTUBE_API_BASE = "https://www.googleapis.com/youtube/v3"
 USER_AGENT = "Long2Shorts/0.1"
 DEFAULT_CHUNK_SECONDS = 600
@@ -113,9 +112,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Download captions first, or audio+Whisper if captions are unavailable.",
     )
     parser.add_argument(
+        "--captions-only",
+        action="store_true",
+        help="Only use downloadable public captions. Do not download audio or start transcription when captions are unavailable.",
+    )
+    parser.add_argument(
         "--generate-packages",
         action="store_true",
         help="Generate shorts packages as soon as transcript preparation is ready.",
+    )
+    parser.add_argument(
+        "--benchmark-profile",
+        type=Path,
+        default=None,
+        help="Optional genre scoring profile passed to package generation.",
     )
     parser.add_argument("--max-comments", type=int, default=300)
     parser.add_argument("--api-key", default="", help="YouTube Data API key. Defaults to env.")
@@ -147,8 +157,7 @@ def default_output_dir(video_id: str) -> Path:
 def get_api_key(explicit: str) -> str:
     if explicit:
         return explicit
-    load_dotenv(BASE_DIR / ".env")
-    load_dotenv(ENV_PATH)
+    load_project_env()
     return os.environ.get("YOUTUBE_API_KEY") or os.environ.get("GOOGLE_API_KEY") or ""
 
 
@@ -431,12 +440,12 @@ def analyze_comments(comments: list[dict]) -> dict:
 
 
 def yt_dlp_command() -> list[str] | None:
-    exe = shutil.which("yt-dlp")
-    if exe:
-        return [exe]
     try:
         import yt_dlp  # noqa: F401
     except Exception:
+        exe = shutil.which("yt-dlp")
+        if exe:
+            return [exe]
         return None
     return [sys.executable, "-m", "yt_dlp"]
 
@@ -497,7 +506,7 @@ def download_video(url: str, video_id: str, download_dir: Path) -> Path | None:
         "--no-playlist",
         *yt_dlp_ffmpeg_args(),
         "-f",
-        "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
+        "bv*[vcodec^=avc1][ext=mp4]+ba[ext=m4a]/bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/best",
         "--merge-output-format",
         "mp4",
         "-o",
@@ -645,7 +654,7 @@ def download_subtitles(url: str, video_id: str, output_dir: Path) -> Path | None
         "--write-subs",
         "--write-auto-subs",
         "--sub-langs",
-        "ko.*,ko,en.*,en",
+        "ko.*,ko",
         "--sub-format",
         "vtt",
         "-o",
@@ -653,9 +662,11 @@ def download_subtitles(url: str, video_id: str, output_dir: Path) -> Path | None
         url,
     ]
     print("[youtube] subtitle_download_started=true", flush=True)
-    subprocess.run(command, check=True)
+    result = subprocess.run(command, check=False)
     candidates = sorted(subtitles_dir.glob(f"youtube_{video_id}*.vtt"))
     if not candidates:
+        if result.returncode != 0:
+            print(f"[youtube] subtitle_download_failed=exit {result.returncode}", flush=True)
         return None
     preferred = sorted(candidates, key=lambda item: (".ko" not in item.name.lower(), len(item.name)))
     return preferred[0]
@@ -715,7 +726,13 @@ def transcribe_audio(audio_path: Path, output_dir: Path) -> None:
         raise RuntimeError(f"Audio transcription failed with exit code {code}")
 
 
-def prepare_transcript(url: str, video_id: str, output_dir: Path, download_dir: Path) -> dict:
+def prepare_transcript(
+    url: str,
+    video_id: str,
+    output_dir: Path,
+    download_dir: Path,
+    allow_audio_fallback: bool = True,
+) -> dict:
     result = {
         "status": "not_started",
         "source": "",
@@ -751,6 +768,15 @@ def prepare_transcript(url: str, video_id: str, output_dir: Path, download_dir: 
         else:
             print("[youtube] subtitle_file=none", flush=True)
 
+        if not allow_audio_fallback:
+            result.update(
+                {
+                    "status": "unavailable",
+                    "error": "No downloadable captions were available and audio fallback was disabled.",
+                }
+            )
+            return result
+
         audio_path = download_audio(url, video_id, download_dir)
         if not audio_path:
             result.update({"status": "failed", "error": "Could not download subtitles or audio."})
@@ -774,11 +800,22 @@ def prepare_transcript(url: str, video_id: str, output_dir: Path, download_dir: 
         return result
 
 
-def safe_prepare_transcript(url: str, video_id: str, output_dir: Path, download_dir: Path) -> dict:
-    return prepare_transcript(url, video_id, output_dir, download_dir)
+def safe_prepare_transcript(
+    url: str,
+    video_id: str,
+    output_dir: Path,
+    download_dir: Path,
+    allow_audio_fallback: bool = True,
+) -> dict:
+    return prepare_transcript(url, video_id, output_dir, download_dir, allow_audio_fallback=allow_audio_fallback)
 
 
-def generate_packages_from_prepared_transcript(output_dir: Path, source_title: str, youtube_context_path: Path) -> dict:
+def generate_packages_from_prepared_transcript(
+    output_dir: Path,
+    source_title: str,
+    youtube_context_path: Path,
+    benchmark_profile_path: Path | None = None,
+) -> dict:
     result = {"status": "not_started", "output": "", "error": ""}
     command = [
         sys.executable,
@@ -791,6 +828,8 @@ def generate_packages_from_prepared_transcript(output_dir: Path, source_title: s
         "--youtube-context",
         str(youtube_context_path),
     ]
+    if benchmark_profile_path and benchmark_profile_path.exists():
+        command.extend(["--benchmark-profile", str(benchmark_profile_path)])
     print("[youtube] package_generation_started=true", flush=True)
     process = subprocess.Popen(
         command,
@@ -831,6 +870,14 @@ def main() -> None:
     download_error = ""
     download_future: Future[tuple[Path | None, str]] | None = None
     transcript_future: Future[dict] | None = None
+    output_path = output_dir / "youtube_context.json"
+    existing_context: dict = {}
+    if output_path.exists():
+        try:
+            existing_context = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_context = {}
+    existing_transcript = existing_context.get("transcript_preparation")
     transcript_preparation = {
         "status": "not_requested",
         "source": "",
@@ -839,8 +886,9 @@ def main() -> None:
         "merged_transcript": "",
         "error": "",
     }
+    if not args.prepare_transcript and isinstance(existing_transcript, dict):
+        transcript_preparation = existing_transcript
     package_generation = {"status": "not_requested", "output": "", "error": ""}
-    output_path = output_dir / "youtube_context.json"
 
     with ThreadPoolExecutor(max_workers=3) as executor:
         if args.download_video:
@@ -859,6 +907,7 @@ def main() -> None:
                 video_id,
                 output_dir,
                 args.download_dir.resolve(),
+                not args.captions_only,
             )
 
         print("[youtube] collecting_context_while_download=true", flush=True)
@@ -908,7 +957,12 @@ def main() -> None:
 
             if args.generate_packages and transcript_preparation.get("status") == "ready":
                 source_title = metadata.get("title") if metadata.get("available") else video_id
-                package_generation = generate_packages_from_prepared_transcript(output_dir, source_title or video_id, output_path)
+                package_generation = generate_packages_from_prepared_transcript(
+                    output_dir,
+                    source_title or video_id,
+                    output_path,
+                    args.benchmark_profile.resolve() if args.benchmark_profile else None,
+                )
                 payload["package_generation"] = package_generation
                 output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
                 print(f"[youtube] context_packages={output_path}", flush=True)

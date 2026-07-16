@@ -44,7 +44,7 @@ The current default style is tuned for `short_templet.png` and the reference sho
       "enabled": true
     },
     "title": {
-      "font_path": "assets/fonts/Jua-Regular.ttf",
+      "font_path": "C:\\Windows\\Fonts\\Pretendard-ExtraBold.ttf",
       "line1": {
         "box": [290, 70, 1040, 165],
         "max_chars": 12,
@@ -55,7 +55,7 @@ The current default style is tuned for `short_templet.png` and the reference sho
       },
       "line2": {
         "box": [80, 245, 1000, 380],
-        "max_chars": 11,
+        "max_chars": 14,
         "image_font_size": 76,
         "min_image_font_size": 56,
         "image_color": "#00E846",
@@ -65,7 +65,7 @@ The current default style is tuned for `short_templet.png` and the reference sho
       }
     },
     "channel": {
-      "font_path": "assets/fonts/Jua-Regular.ttf",
+      "font_path": "C:\\Windows\\Fonts\\Pretendard-ExtraBold.ttf",
       "suffix": "",
       "box": [0, 1515, 1080, 1610],
       "image_font_size": 72,
@@ -103,8 +103,8 @@ The current default style is tuned for `short_templet.png` and the reference sho
 
 ## Notes
 
-- `font_path` is used by rendered text overlays. The bundled default is `assets/fonts/Jua-Regular.ttf`.
-- Rendered title/source overlays default to Jua. If `capcut.text_overlay.enabled` is false, editable CapCut text falls back to `Poppins_Bold` for the title and `Montserrat` for point captions/source text.
+- `font_path` is used by rendered text overlays. The default is the locally installed `C:\\Windows\\Fonts\\Pretendard-ExtraBold.ttf`, with the bundled Jua file retained only as a fallback.
+- Rendered title/source overlays use Pretendard ExtraBold by default. This image-overlay mode is enabled by default so the rendered font does not depend on CapCut's available font list. Set `capcut.text_overlay.enabled` to `false` only when editable CapCut title text is needed.
 - `style.color`, `border.color`, `image_color`, and `image_stroke_color` accept `#RRGGBB`.
 - `short_templet.png` has a transparent video window from y=432 to y=1487.
 - You can override the frame image at runtime with `--template-image path/to/frame.png`.

@@ -1,0 +1,128 @@
+{
+  "profile_id": "korean_variety_rescene_gyaru_v1",
+  "name": "Korean variety: RESCENE Gyaru / Geoje benchmark",
+  "scope": "Use only to score Korean variety, idol self-content, talk, and vlog source footage. This profile is a selection rubric, not a title or joke template.",
+  "reference_sources": [
+    {
+      "video_id": "heifaIjlSUc",
+      "title": "갸루의 자세에 대해서 배워보았습니다",
+      "role": "origin",
+      "observed_signal": "The unexpected Geoje Yaho response became a reusable meme."
+    },
+    {
+      "video_id": "OrCOflk2QmQ",
+      "title": "갸루와 거제에 왔습니다 (거제 1편)",
+      "role": "payoff_expansion",
+      "observed_signal": "The character contrast and relationship continue in a real place with visible reactions."
+    },
+    {
+      "video_id": "SF29doLuBfc",
+      "title": "갸루와 거제 2편",
+      "role": "payoff_expansion",
+      "observed_signal": "A familiar running joke is refreshed with new audience-facing consequences."
+    },
+    {
+      "video_id": "bvUS-ri9nqQ",
+      "title": "갸루 출신 일본인에게 일본어 배우기",
+      "role": "character_engine",
+      "observed_signal": "A specific persona and conversational mismatch create repeatable cut points."
+    },
+    {
+      "video_id": "NS7tSrMrWsc",
+      "title": "하루종일 사투리만 써봤습니다",
+      "role": "language_engine",
+      "observed_signal": "Dialect and identity create a compact, understandable interaction engine."
+    },
+    {
+      "video_id": "JJBf0jCcfrQ",
+      "title": "떡상 전 성수나들이 (사투리2편)",
+      "role": "relationship_engine",
+      "observed_signal": "Natural relationship dynamics can carry a clip without a large staged event."
+    }
+  ],
+  "score": {
+    "max_score": 100,
+    "pass_score": 78,
+    "review_score": 68,
+    "dimensions": [
+      {
+        "id": "hook_immediacy",
+        "weight": 18,
+        "question": "Within the first 1.5 seconds, is there a strange line, strong reaction, unusual image, or unresolved question that stops scrolling?"
+      },
+      {
+        "id": "character_contrast",
+        "weight": 16,
+        "question": "Does the clip show a legible contrast in persona, language, style, status, or expectation between people?"
+      },
+      {
+        "id": "unexpected_turn",
+        "weight": 16,
+        "question": "Is there an answer, action, correction, or reveal that is meaningfully less predictable than the setup?"
+      },
+      {
+        "id": "visible_or_audible_reaction",
+        "weight": 14,
+        "question": "Does a face, voice, group, or situation visibly or audibly react after the trigger?"
+      },
+      {
+        "id": "payoff_closure",
+        "weight": 12,
+        "question": "Does the short land on a punchline, reaction, reveal, or emotional release instead of fading out?"
+      },
+      {
+        "id": "standalone_clarity",
+        "weight": 10,
+        "question": "Can a first-time viewer understand the situation and why it is funny with at most one short caption?"
+      },
+      {
+        "id": "visual_shortability",
+        "weight": 8,
+        "question": "Can the key people and action survive a 9:16 crop, with at least five purposeful source cuts?"
+      },
+      {
+        "id": "meme_reusability",
+        "weight": 6,
+        "question": "Is there a compact phrase, gesture, sound, or relationship beat people can quote, imitate, or reuse?"
+      }
+    ],
+    "penalties": [
+      {
+        "id": "context_dependency",
+        "max_deduction": 15,
+        "rule": "Deduct when the payoff cannot be understood without a long explanation or earlier unseen plot."
+      },
+      {
+        "id": "no_payoff",
+        "max_deduction": 15,
+        "rule": "Deduct when the clip ends before a response, reveal, or consequence."
+      },
+      {
+        "id": "visual_mismatch",
+        "max_deduction": 10,
+        "rule": "Deduct when the transcript is amusing but the source image is static, obstructed, or unsuitable for vertical reframing."
+      },
+      {
+        "id": "duplicate_thread",
+        "max_deduction": 10,
+        "rule": "Deduct when another candidate tells the same joke with clearer evidence or a stronger payoff."
+      }
+    ]
+  },
+  "selection_rules": [
+    "Prefer a compact trigger -> mismatch or escalation -> reaction -> payoff structure.",
+    "For a running joke, use a later payoff as the opening only when the following source cuts recover the exact reason it is funny.",
+    "Treat relationship chemistry as source evidence: teasing, care, embarrassment, correction, and deadpan responses can be the event.",
+    "Use an on-screen caption only to bind a small missing fact. Do not use captions to invent the joke or replace the payoff.",
+    "Do not select a pleasant conversation merely because the performers are recognizable; select a beat with a change and a response."
+  ],
+  "decision_policy": {
+    "auto_render": "score >= 78 and no penalty above 5",
+    "human_review": "68 <= score < 78, or a high-scoring candidate has an unresolved context or crop risk",
+    "reject": "score < 68, or the candidate has no visible/audible payoff"
+  },
+  "notes": [
+    "The initial benchmark comes from publicly visible performance and editorial analysis of the Gyaru / Geoje series in June-July 2026. It is a hypothesis to validate against your own channel retention data.",
+    "Reference videos are for analysis only. Do not republish their footage without the relevant rights."
+  ]
+}

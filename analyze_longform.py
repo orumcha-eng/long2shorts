@@ -8,13 +8,13 @@ import sys
 from pathlib import Path
 
 import imageio_ffmpeg
-from dotenv import load_dotenv
 from openai import OpenAI
 from pymediainfo import MediaInfo
 
+from env_loader import format_checked_env_paths, load_project_env
+
 
 BASE_DIR = Path(__file__).resolve().parent
-ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 DEFAULT_CHUNK_SECONDS = 600
 TRANSCRIBE_MODEL = "whisper-1"
 TRANSCRIBE_LANGUAGE = "ko"
@@ -71,10 +71,10 @@ def get_duration_seconds(path: Path) -> float:
 
 
 def load_client() -> OpenAI:
-    load_dotenv(ENV_PATH)
+    load_project_env()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(f"OPENAI_API_KEY not found in {ENV_PATH}")
+        raise RuntimeError(f"OPENAI_API_KEY not found. Checked: {format_checked_env_paths()}")
     return OpenAI(api_key=api_key)
 
 

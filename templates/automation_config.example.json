@@ -1,0 +1,63 @@
+{
+  "library": {
+    "max_sources_per_run": 1,
+    "sources": [
+      {
+        "analysis_dir": "analysis/my_owned_longform",
+        "source_video": "D:/media/my_owned_longform.mp4",
+        "source_title": "My owned longform title",
+        "owned": true,
+        "active": true,
+        "priority": 10
+      }
+    ]
+  },
+  "trend": {
+    "enabled": true,
+    "config_path": "templates/trend_config.example.json",
+    "window_hours": 72,
+    "candidate_limit": 20
+  },
+  "source_acquisition": {
+    "enabled": true,
+    "strategy": "selected_trend",
+    "download_video": true,
+    "prepare_transcript": true,
+    "captions_only": false,
+    "download_dir": "downloads",
+    "max_comments": 300,
+    "mark_processed_after_render": true
+  },
+  "benchmark_profile": "templates/benchmark_profiles/rescene_gyaru_variety.json",
+  "generation": {
+    "model": "gpt-4.1-mini",
+    "include_wide_windows": true,
+    "force": false
+  },
+  "production": {
+    "enabled": true,
+    "max_packages_per_source": 1,
+    "minimum_score": 85,
+    "allowed_decisions": ["auto_render"]
+  },
+  "review": {
+    "enabled": true
+  },
+  "learning": {
+    "min_evaluated_videos": 3,
+    "low_average_view_percentage": 60.0
+  },
+  "youtube_analytics": {
+    "enabled": false,
+    "oauth_client_secret_path": "secrets/youtube_oauth_client.json",
+    "token_path": "secrets/youtube_analytics_token.json",
+    "interactive_on_first_run": false
+  },
+  "youtube_upload": {
+    "enabled": false,
+    "require_review_approval": true,
+    "privacy_status": "private",
+    "category_id": "24",
+    "made_for_kids": false
+  }
+}

@@ -5,14 +5,14 @@ import subprocess
 from pathlib import Path
 
 import imageio_ffmpeg
-from dotenv import load_dotenv
 from openai import OpenAI
 from pymediainfo import MediaInfo
+
+from env_loader import format_checked_env_paths, load_project_env
 
 
 BASE_DIR = Path(__file__).resolve().parent
 SOURCE_VIDEO = BASE_DIR / "지은수대통1회.mp4"
-ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 OUTPUT_DIR = BASE_DIR / "analysis" / "jiunsudaetong1"
 CHUNKS_DIR = OUTPUT_DIR / "chunks"
 TRANSCRIPTS_DIR = OUTPUT_DIR / "transcripts"
@@ -39,10 +39,10 @@ def get_duration_seconds(path: Path) -> float:
 
 
 def load_client() -> OpenAI:
-    load_dotenv(ENV_PATH)
+    load_project_env()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(f"OPENAI_API_KEY not found in {ENV_PATH}")
+        raise RuntimeError(f"OPENAI_API_KEY not found. Checked: {format_checked_env_paths()}")
     return OpenAI(api_key=api_key)
 
 

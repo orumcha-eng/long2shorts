@@ -8,17 +8,25 @@ import threading
 from io import BytesIO
 from pathlib import Path
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import filedialog, messagebox, ttk
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageTk
+
+from discover_trending_sources import mark_processed_source
 
 
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 REFERENCE_CHANNELS_PATH = BASE_DIR / "reference_channels.json"
+ORCHESTRATOR_CONFIG_PATH = BASE_DIR / "automation_config.json"
+BENCHMARK_PROFILE_OPTIONS: dict[str, Path | None] = {
+    "Korean variety (RESCENE)": BASE_DIR / "templates" / "benchmark_profiles" / "rescene_gyaru_variety.json",
+    "No benchmark": None,
+}
 
 PROCESS_STAGES = [
+    ("trend", "0. 트렌드 후보 탐색", "최근 3일 예능/연예 롱폼 후보를 찾고 자동 처리할 원본을 고릅니다."),
     ("link", "1. 링크/메타데이터", "YouTube URL, 제목, 길이, 댓글 가능 여부를 확인합니다."),
     ("comments", "2. 댓글 반응 분석", "타임스탬프 댓글, 좋아요, 답글, 감정 키워드를 수집합니다."),
     ("media", "3. 영상 파일 확보", "yt-dlp로 YouTube 영상을 다운로드합니다."),
@@ -148,6 +156,24 @@ def format_seconds(value) -> str:
     return f"{minutes}:{sec:02d}"
 
 
+def configure_tcl_library_paths() -> None:
+    candidates = [
+        Path(sys.base_prefix) / "tcl",
+        Path(sys.prefix) / "tcl",
+        Path(r"C:\Users\user\AppData\Local\Programs\Python\Python313\tcl"),
+        Path(r"C:\Users\user\AppData\Local\Programs\Python\Python311\tcl"),
+    ]
+    for root in candidates:
+        tcl_dir = root / "tcl8.6"
+        tk_dir = root / "tk8.6"
+        if tcl_dir.exists() and "TCL_LIBRARY" not in os.environ:
+            os.environ["TCL_LIBRARY"] = str(tcl_dir)
+        if tk_dir.exists() and "TK_LIBRARY" not in os.environ:
+            os.environ["TK_LIBRARY"] = str(tk_dir)
+        if "TCL_LIBRARY" in os.environ and "TK_LIBRARY" in os.environ:
+            return
+
+
 class Long2ShortsApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -173,6 +199,7 @@ class Long2ShortsApp:
         self.title_var = tk.StringVar()
         self.analysis_dir_var = tk.StringVar()
         self.reference_channel_var = tk.StringVar()
+        self.benchmark_profile_var = tk.StringVar(value="Korean variety (RESCENE)")
         self.reference_status_var = tk.StringVar(value="참고 채널을 추가하면 최신 영상이 표시됩니다.")
         self.force_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="대기 중")
@@ -191,6 +218,7 @@ class Long2ShortsApp:
         self.reference_thumbnail_label: ttk.Label | None = None
         self.reference_title_label: ttk.Label | None = None
         self.reference_thumbnail_image: ImageTk.PhotoImage | None = None
+        self.max_auto_capcut_var = tk.IntVar(value=10)
 
         self._build_ui()
         self.load_reference_channels()
@@ -209,6 +237,8 @@ class Long2ShortsApp:
         )
         url_actions = ttk.Frame(source_frame)
         url_actions.grid(row=0, column=2, sticky="ew")
+        self._make_button(url_actions, "내 롱폼", self.on_choose_owned_source_video).pack(side="left")
+        self._make_button(url_actions, "라이브러리 등록", self.on_register_owned_source).pack(side="left", padx=(6, 0))
         self._make_button(url_actions, "댓글/반응 분석", self.on_collect_youtube_context).pack(side="left")
         self._make_button(url_actions, "다운로드+분석", self.on_download_youtube_video).pack(side="left", padx=(6, 0))
 
@@ -227,6 +257,19 @@ class Long2ShortsApp:
 
         action_frame = ttk.Frame(outer, padding=(0, 10, 0, 10))
         action_frame.pack(fill="x")
+        self._make_button(action_frame, "오늘 쇼츠 제작", self.on_daily_shorts_run).pack(side="left")
+        self._make_button(action_frame, "트렌드 자동 생성", self.on_auto_trend_generate).pack(side="left")
+        ttk.Label(action_frame, text="원본당 최대").pack(side="left", padx=(8, 2))
+        ttk.Spinbox(action_frame, from_=1, to=10, width=3, textvariable=self.max_auto_capcut_var).pack(side="left")
+        ttk.Label(action_frame, text="Benchmark").pack(side="left", padx=(8, 2))
+        ttk.Combobox(
+            action_frame,
+            textvariable=self.benchmark_profile_var,
+            values=list(BENCHMARK_PROFILE_OPTIONS),
+            state="readonly",
+            width=24,
+        ).pack(side="left")
+        ttk.Label(action_frame, text="개").pack(side="left", padx=(2, 10))
         self._make_button(action_frame, "쇼츠 시놉시스 생성", self.on_generate_packages).pack(side="left")
         self._make_button(action_frame, "목록 새로고침", self.on_refresh_packages).pack(side="left", padx=8)
         self._make_button(action_frame, "미리보기 열기", self.on_open_preview).pack(side="left")
@@ -254,8 +297,10 @@ class Long2ShortsApp:
         candidate_frame = ttk.LabelFrame(left, text="쇼츠 후보", padding=10)
         candidate_frame.pack(fill="both", expand=True)
 
-        columns = ("rank", "title", "reaction", "tags", "clarity", "protagonist")
+        columns = ("rank", "score", "decision", "title", "reaction", "tags", "clarity", "protagonist")
         self.package_tree = ttk.Treeview(candidate_frame, columns=columns, show="headings", height=14)
+        self.package_tree.heading("score", text="Score")
+        self.package_tree.heading("decision", text="Decision")
         self.package_tree.heading("rank", text="순위")
         self.package_tree.heading("title", text="제목")
         self.package_tree.heading("reaction", text="댓글 신호")
@@ -263,6 +308,8 @@ class Long2ShortsApp:
         self.package_tree.heading("clarity", text="독립 이해도")
         self.package_tree.heading("protagonist", text="주인공")
         self.package_tree.column("rank", width=55, anchor="center")
+        self.package_tree.column("score", width=65, anchor="center")
+        self.package_tree.column("decision", width=90, anchor="center")
         self.package_tree.column("title", width=360)
         self.package_tree.column("reaction", width=120, anchor="center")
         self.package_tree.column("tags", width=190)
@@ -813,6 +860,48 @@ class Long2ShortsApp:
             self.set_stage_status("link", "완료", "YouTube 컨텍스트 파일을 불러왔습니다.")
             self.set_stage_status("comments", "완료", f"댓글 {fetched}개, 타임스탬프 반응 {len(moments)}개")
 
+    def on_choose_owned_source_video(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="내 롱폼 원본 선택",
+            filetypes=[("Video files", "*.mp4 *.mkv *.mov *.webm"), ("All files", "*.*")],
+        )
+        if selected:
+            self.set_video(Path(selected))
+
+    def on_register_owned_source(self) -> None:
+        video_path = self.ensure_ready_video()
+        if not video_path:
+            return
+        analysis_dir = analysis_dir_for_video(video_path)
+        source_title = self.title_var.get().strip() or video_path.stem
+
+        def task() -> None:
+            try:
+                self.log_queue.put(("status", "내 롱폼 라이브러리 등록 중"))
+                self.run_subprocess(
+                    [
+                        str(self.python_exe),
+                        "shorts_orchestrator.py",
+                        "--config",
+                        str(ORCHESTRATOR_CONFIG_PATH),
+                        "register-source",
+                        "--source-video",
+                        str(video_path),
+                        "--analysis-dir",
+                        str(analysis_dir),
+                        "--source-title",
+                        source_title,
+                        "--confirm-owned",
+                    ]
+                )
+                self.log_queue.put(("log", "[gui] owned source registered"))
+                self.log_queue.put(("status", "라이브러리 등록 완료"))
+            except Exception as exc:
+                self.log_queue.put(("error", f"라이브러리 등록 실패: {exc}"))
+                self.log_queue.put(("status", "대기 중"))
+
+        self.start_worker(task, "내 롱폼 라이브러리 등록 중")
+
     def get_video_path(self) -> Path | None:
         value = self.video_path_var.get().strip()
         if not value:
@@ -981,6 +1070,265 @@ class Long2ShortsApp:
     def get_youtube_url(self) -> str:
         return self.youtube_url_var.get().strip()
 
+    def selected_benchmark_profile_path(self) -> Path | None:
+        path = BENCHMARK_PROFILE_OPTIONS.get(self.benchmark_profile_var.get())
+        return path if path and path.exists() else None
+
+    @staticmethod
+    def package_genre_score(pkg: dict) -> tuple[str, str]:
+        scorecard = pkg.get("genre_scorecard") if isinstance(pkg.get("genre_scorecard"), dict) else {}
+        if not scorecard:
+            return "-", "-"
+        return str(scorecard.get("total", "-")), str(scorecard.get("decision", "-"))
+
+    @staticmethod
+    def package_auto_render_allowed(pkg: dict) -> bool:
+        scorecard = pkg.get("genre_scorecard") if isinstance(pkg.get("genre_scorecard"), dict) else {}
+        return not scorecard or scorecard.get("decision") == "auto_render"
+
+    def first_log_value(self, lines: list[str], prefix: str) -> str:
+        for line in lines:
+            if line.startswith(prefix):
+                return line.split("=", 1)[1].strip()
+        return ""
+
+    def load_package_items_for_auto(self, package_path: Path, source_label: str) -> list[dict]:
+        data = json.loads(package_path.read_text(encoding="utf-8"))
+        source_title = first_nonempty_string(data.get("source_title"), source_label)
+        movie_info = data.get("movie_info")
+        packages: list[dict] = []
+        for item in data.get("shorts", []) or []:
+            if not isinstance(item, dict):
+                continue
+            pkg = dict(item)
+            if source_label:
+                pkg.setdefault("source_label", source_label)
+            if source_title:
+                pkg.setdefault("source_title", source_title)
+            if isinstance(movie_info, dict):
+                pkg.setdefault("movie_info", movie_info)
+            packages.append(pkg)
+        return packages
+
+    def write_auto_runtime_package(self, video_path: Path, pkg: dict, source_label: str) -> Path:
+        short_id = pkg.get("short_id")
+        if not short_id:
+            raise RuntimeError("자동 생성 패키지에 short_id가 없습니다.")
+        runtime_path = runtime_package_path(video_path, short_id)
+        runtime_path.parent.mkdir(parents=True, exist_ok=True)
+        runtime_pkg = dict(pkg)
+        if source_label:
+            runtime_pkg.setdefault("source_label", source_label)
+        runtime_path.write_text(json.dumps(runtime_pkg, ensure_ascii=False, indent=2), encoding="utf-8")
+        return runtime_path
+
+    @staticmethod
+    def has_registered_owned_sources() -> bool:
+        if not ORCHESTRATOR_CONFIG_PATH.exists():
+            return False
+        try:
+            config = json.loads(ORCHESTRATOR_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        library = config.get("library", {}) if isinstance(config.get("library"), dict) else {}
+        sources = library.get("sources", []) if isinstance(library.get("sources"), list) else []
+        return any(
+            isinstance(source, dict)
+            and source.get("owned") is True
+            and bool(source.get("source_video"))
+            for source in sources
+        )
+
+    @staticmethod
+    def has_daily_source_strategy() -> bool:
+        if Long2ShortsApp.has_registered_owned_sources():
+            return True
+        if not ORCHESTRATOR_CONFIG_PATH.exists():
+            return False
+        try:
+            config = json.loads(ORCHESTRATOR_CONFIG_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        acquisition = config.get("source_acquisition", {}) if isinstance(config.get("source_acquisition"), dict) else {}
+        return bool(acquisition.get("enabled", False))
+
+    def on_daily_shorts_run(self) -> None:
+        if not self.has_daily_source_strategy():
+            messagebox.showwarning(
+                "소스 설정 필요",
+                "트렌드 원본 자동 선정 또는 내 롱폼 라이브러리 중 하나가 활성화되어야 합니다.",
+            )
+            self.log_queue.put(("status", "소스 설정 대기 중"))
+            return
+        self.reset_process_board()
+
+        def task() -> None:
+            try:
+                self.log_queue.put(("status", "오늘 쇼츠 제작 준비 중"))
+                self.run_subprocess(
+                    [
+                        str(self.python_exe),
+                        "shorts_orchestrator.py",
+                        "--config",
+                        str(ORCHESTRATOR_CONFIG_PATH),
+                        "daily-run",
+                        "--execute",
+                    ]
+                )
+                self.log_queue.put(("log", "[gui] daily orchestration completed"))
+                self.log_queue.put(("status", "패키지 검토 대기"))
+            except Exception as exc:
+                self.log_queue.put(("error", f"오늘 쇼츠 제작 실패: {exc}"))
+                self.log_queue.put(("status", "대기 중"))
+
+        self.start_worker(task, "오늘 쇼츠 제작 중")
+
+    def on_auto_trend_generate(self) -> None:
+        try:
+            max_capcut = int(self.max_auto_capcut_var.get())
+        except Exception:
+            max_capcut = 10
+        max_capcut = max(1, min(10, max_capcut))
+        self.reset_process_board()
+        benchmark_profile_path = self.selected_benchmark_profile_path()
+
+        def task() -> None:
+            selected_url = ""
+            selected_video_id = ""
+            selected_title = ""
+            selected_channel = ""
+            context_path = ""
+            downloaded_video = ""
+            package_output = ""
+            capcut_created = 0
+
+            try:
+                self.log_queue.put(("status", "트렌드 후보 탐색 중"))
+                self.log_queue.put(("phase", "최근 3일 예능/연예 롱폼 후보 탐색 중"))
+                self.log_queue.put(("stage_status", {"key": "trend", "status": "진행", "note": "최근 72시간 후보를 수집하고 green 원본을 고릅니다."}))
+
+                trend_lines = self.run_subprocess(
+                    [
+                        str(self.python_exe),
+                        "discover_trending_sources.py",
+                        "--window-hours",
+                        "72",
+                        "--limit",
+                        "20",
+                    ]
+                )
+                selected_url = self.first_log_value(trend_lines, "[trend] selected_url=")
+                selected_video_id = self.first_log_value(trend_lines, "[trend] selected_video_id=")
+                selected_title = self.first_log_value(trend_lines, "[trend] selected_title=")
+                selected_channel = self.first_log_value(trend_lines, "[trend] selected_channel=")
+                if not selected_url or not selected_video_id:
+                    raise RuntimeError("최근 72시간 안에서 자동 처리 가능한 green 후보를 찾지 못했습니다.")
+
+                self.log_queue.put(("set_youtube_url", selected_url))
+                self.log_queue.put(("set_title", selected_title))
+                self.log_queue.put(("stage_status", {"key": "trend", "status": "완료", "note": f"{selected_channel} / {selected_title}"}))
+                self.log_queue.put(("status", "선택된 트렌드 원본 다운로드/분석 중"))
+
+                collect_command = [
+                    str(self.python_exe),
+                    "collect_youtube_context.py",
+                    "--url",
+                    selected_url,
+                    "--max-comments",
+                    "300",
+                    "--download-video",
+                    "--prepare-transcript",
+                    "--generate-packages",
+                    "--download-dir",
+                    str(DOWNLOADS_DIR),
+                ]
+                if benchmark_profile_path:
+                    collect_command.extend(["--benchmark-profile", str(benchmark_profile_path)])
+                collect_lines = self.run_subprocess(collect_command)
+
+                for line in collect_lines:
+                    if line.startswith("[youtube] context_packages="):
+                        context_path = line.split("=", 1)[1].strip()
+                    elif line.startswith("[youtube] context_transcript=") and not context_path:
+                        context_path = line.split("=", 1)[1].strip()
+                    elif line.startswith("[youtube] context=") and not context_path:
+                        context_path = line.split("=", 1)[1].strip()
+                    elif line.startswith("[youtube] downloaded_video="):
+                        downloaded_video = line.split("=", 1)[1].strip()
+                    elif line.startswith("[youtube] package_generation_done="):
+                        package_output = line.split("=", 1)[1].strip()
+
+                if context_path:
+                    self.log_queue.put(("youtube_context_loaded", context_path))
+                if downloaded_video:
+                    self.log_queue.put(("video_downloaded", downloaded_video))
+
+                if not package_output and context_path:
+                    context = json.loads(Path(context_path).read_text(encoding="utf-8"))
+                    package_output = ((context.get("package_generation") or {}).get("output") or "")
+                    downloaded_video = downloaded_video or context.get("downloaded_video", "")
+                    selected_channel = selected_channel or ((context.get("metadata") or {}).get("channel_title") or "")
+                    selected_title = selected_title or ((context.get("metadata") or {}).get("title") or "")
+
+                video_path = Path(downloaded_video)
+                package_path = Path(package_output) if package_output else None
+                if not video_path.exists():
+                    raise RuntimeError("트렌드 원본 다운로드 파일을 찾지 못했습니다.")
+                if not package_path or not package_path.is_file():
+                    raise RuntimeError("쇼츠 패키지 결과 파일을 찾지 못했습니다.")
+
+                packages = self.load_package_items_for_auto(package_path, selected_channel)
+                auto_render_packages = [pkg for pkg in packages if self.package_auto_render_allowed(pkg)]
+                if len(auto_render_packages) != len(packages):
+                    self.log_queue.put(
+                        (
+                            "log",
+                            f"[gui] benchmark gate: {len(packages) - len(auto_render_packages)} review/reject packages skipped",
+                        )
+                    )
+                packages = auto_render_packages
+                if not packages:
+                    raise RuntimeError("품질 기준을 통과한 쇼츠 패키지가 없습니다.")
+
+                self.log_queue.put(("status", "CapCut draft 자동 생성 중"))
+                self.log_queue.put(("phase", f"CapCut draft 자동 생성 중: {min(len(packages), max_capcut)}개"))
+                self.log_queue.put(("stage_status", {"key": "output", "status": "진행", "note": f"CapCut draft 최대 {max_capcut}개 생성"}))
+
+                for pkg in packages[:max_capcut]:
+                    short_id = pkg.get("short_id", "")
+                    runtime_path = self.write_auto_runtime_package(video_path, pkg, selected_channel)
+                    command = [
+                        str(self.python_exe),
+                        "build_capcut_from_package.py",
+                        "--source-video",
+                        str(video_path),
+                        "--package",
+                        str(runtime_path),
+                    ]
+                    if selected_channel:
+                        command.extend(["--channel-name", selected_channel])
+                    self.run_subprocess(command)
+                    capcut_created += 1
+                    self.log_queue.put(("log", f"[gui] CapCut draft 자동 생성 완료: {short_id}"))
+
+                mark_processed_source(
+                    video_id=selected_video_id,
+                    source_url=selected_url,
+                    title=selected_title,
+                    channel_title=selected_channel,
+                    shorts_created=len(packages),
+                    capcut_drafts_created=capcut_created,
+                )
+                self.log_queue.put(("refresh_packages", str(video_path)))
+                self.log_queue.put(("stage_status", {"key": "output", "status": "완료", "note": f"CapCut draft {capcut_created}개 생성 완료"}))
+                self.log_queue.put(("status", "대기 중"))
+                self.log_queue.put(("phase", f"트렌드 자동 생성 완료: CapCut draft {capcut_created}개"))
+            except Exception as exc:
+                self.log_queue.put(("error", f"트렌드 자동 생성 실패: {exc}"))
+                self.log_queue.put(("status", "대기 중"))
+
+        self.start_worker(task, "트렌드 자동 생성 중")
+
     def on_collect_youtube_context(self) -> None:
         self.collect_youtube_context(download_video=False)
 
@@ -1113,7 +1461,7 @@ class Long2ShortsApp:
                 self.log_queue.put(("log", clean))
                 if clean.startswith("[youtube]"):
                     self.update_stages_from_log(clean)
-                if clean.startswith("[analyze]") or clean.startswith("[package]") or clean.startswith("[preview]") or clean.startswith("[capcut]"):
+                if clean.startswith("[trend]") or clean.startswith("[analyze]") or clean.startswith("[package]") or clean.startswith("[preview]") or clean.startswith("[capcut]") or clean.startswith("[orchestrator]"):
                     self.log_queue.put(("phase", clean))
                     self.update_stages_from_log(clean)
             code = process.wait()
@@ -1129,7 +1477,47 @@ class Long2ShortsApp:
 
     def update_stages_from_log(self, line: str) -> None:
         stage_payload = None
-        if line.startswith("[youtube] video_id=") or line.startswith("[youtube] metadata"):
+        if line.startswith("[orchestrator] phase=trend_research"):
+            stage_payload = {"key": "trend", "status": "진행", "note": "트렌드 신호 조사 중"}
+        elif line.startswith("[orchestrator] phase=source_acquisition"):
+            stage_payload = {"key": "media", "status": "진행", "note": "선정 롱폼 다운로드/전사 준비 중"}
+        elif line.startswith("[orchestrator] phase=source_analysis"):
+            stage_payload = {"key": "transcript", "status": "진행", "note": line.split("source=", 1)[-1]}
+        elif line.startswith("[orchestrator] phase=package_generation"):
+            stage_payload = {"key": "candidates", "status": "진행", "note": line.split("source=", 1)[-1]}
+        elif line.startswith("[orchestrator] phase=render"):
+            stage_payload = {"key": "output", "status": "진행", "note": "세로형 MP4 렌더 중"}
+        elif line.startswith("[orchestrator] phase=review"):
+            stage_payload = {"key": "output", "status": "진행", "note": "검토 항목 등록 중"}
+        elif line.startswith("[orchestrator] phase=upload"):
+            stage_payload = {"key": "output", "status": "진행", "note": "YouTube 업로드 중"}
+        elif line.startswith("[orchestrator] learning_rule="):
+            stage_payload = {"key": "candidates", "status": "진행", "note": f"학습 규칙: {line.split('=', 1)[1]}"}
+        elif line.startswith("[orchestrator] change_note="):
+            stage_payload = {"key": "candidates", "status": "진행", "note": line.split("=", 1)[1]}
+        elif line.startswith("[orchestrator] selected_source="):
+            stage_payload = {"key": "trend", "status": "완료", "note": line.split("=", 1)[1]}
+        elif line.startswith("[orchestrator] source_acquisition="):
+            stage_payload = {"key": "media", "status": "완료", "note": line}
+        elif line.startswith("[orchestrator] package_output="):
+            stage_payload = {"key": "output", "status": "완료", "note": Path(line.split("=", 1)[1]).name}
+        elif line.startswith("[orchestrator] rendered_output="):
+            stage_payload = {"key": "output", "status": "완료", "note": Path(line.split("=", 1)[1]).name}
+        elif line.startswith("[orchestrator] review_item="):
+            review_path = line.split("review_item=", 1)[1].split(" status=", 1)[0].strip()
+            stage_payload = {"key": "output", "status": "검토 대기", "note": Path(review_path).name}
+        elif line.startswith("[orchestrator] uploaded_video="):
+            stage_payload = {"key": "output", "status": "완료", "note": f"YouTube: {line.split('=', 1)[1]}"}
+        elif line.startswith("[trend] candidates="):
+            stage_payload = {"key": "trend", "status": "진행", "note": f"후보 {line.split('=', 1)[1]}개 수집"}
+        elif line.startswith("[trend] rank="):
+            stage_payload = {"key": "trend", "status": "진행", "note": line}
+        elif line.startswith("[trend] selected_url="):
+            value = line.split("=", 1)[1].strip()
+            stage_payload = {"key": "trend", "status": "완료" if value else "보류", "note": value or "자동 처리 가능한 green 후보 없음"}
+        elif line.startswith("[trend] output="):
+            stage_payload = {"key": "trend", "status": "완료", "note": f"후보 목록 저장: {Path(line.split('=', 1)[1]).name}"}
+        elif line.startswith("[youtube] video_id=") or line.startswith("[youtube] metadata"):
             stage_payload = {"key": "link", "status": "진행", "note": line}
         elif line.startswith("[youtube] parallel_download_started="):
             stage_payload = {"key": "media", "status": "진행", "note": "영상 다운로드를 먼저 백그라운드로 시작"}
@@ -1212,6 +1600,7 @@ class Long2ShortsApp:
         movie_info_path = movie_info_path_for_video(video_path) if self.movie_info else None
         youtube_context_path = self.resolve_youtube_context_path(video_path)
         force = self.force_var.get()
+        benchmark_profile_path = self.selected_benchmark_profile_path()
 
         def task() -> None:
             self.log_queue.put(("status", "전사/시놉시스 생성 중"))
@@ -1245,6 +1634,8 @@ class Long2ShortsApp:
                     command.extend(["--movie-info", str(movie_info_path)])
                 if youtube_context_path:
                     command.extend(["--youtube-context", str(youtube_context_path)])
+                if benchmark_profile_path:
+                    command.extend(["--benchmark-profile", str(benchmark_profile_path)])
                 if force:
                     command.append("--force")
                 self.run_subprocess(command)
@@ -1302,11 +1693,12 @@ class Long2ShortsApp:
             reaction = self.format_package_comment_signal(pkg)
             clarity = pkg.get("standalone_clarity", "-")
             protagonist = pkg.get("protagonist_presence", "-")
+            genre_score, genre_decision = self.package_genre_score(pkg)
             self.package_tree.insert(
                 "",
                 "end",
                 iid=str(idx),
-                values=(pkg.get("global_rank", idx + 1), title, reaction, tags, clarity, protagonist),
+                values=(pkg.get("global_rank", idx + 1), genre_score, genre_decision, title, reaction, tags, clarity, protagonist),
             )
 
         self.append_log(f"[gui] 쇼츠 패키지 {len(self.packages)}개를 불러왔습니다.")
@@ -1346,6 +1738,38 @@ class Long2ShortsApp:
 
         return ", ".join(sections) if sections else "기본값 사용"
 
+    def upload_hashtag(self, text: str) -> str:
+        cleaned = re.sub(r"[^0-9A-Za-z가-힣_]", "", text or "")
+        return f"#{cleaned}" if cleaned else ""
+
+    def suggest_upload_title(self, pkg: dict) -> str:
+        explicit = first_nonempty_string(pkg.get("upload_title"), pkg.get("youtube_upload_title"))
+        if explicit:
+            return explicit
+
+        title_line1 = first_nonempty_string(pkg.get("title_line1"))
+        title_line2 = first_nonempty_string(pkg.get("title_line2"))
+        if title_line1 and title_line2:
+            title = f"{title_line1}, {title_line2}"
+        else:
+            title = first_nonempty_string(title_line1, title_line2, pkg.get("hook_line"), pkg.get("core_event"))
+
+        hashtags: list[str] = []
+        source_label = first_nonempty_string(pkg.get("source_label"), pkg.get("source_title"))
+        if source_label:
+            source_tag = self.upload_hashtag(source_label.split()[0])
+            if source_tag:
+                hashtags.append(source_tag)
+        for tag_text in safe_list(pkg.get("fun_tags")):
+            tag = self.upload_hashtag(str(tag_text))
+            if tag and tag not in hashtags:
+                hashtags.append(tag)
+            if len(hashtags) >= 3:
+                break
+
+        suffix = f" {' '.join(hashtags)}" if hashtags else ""
+        return f"{title}{suffix}".strip()
+
     def format_package_detail(self, pkg: dict) -> str:
         tags = ", ".join(safe_list(pkg.get("fun_tags"), ["미정"]))
         characters = ", ".join(safe_list(pkg.get("main_characters"), ["미정"]))
@@ -1357,8 +1781,11 @@ class Long2ShortsApp:
         capcut_summary = self.describe_capcut_settings(pkg)
         comment_signal = self.format_package_comment_signal(pkg)
         clip_total_sec = sum(max(0.0, float(clip.get("source_end", 0.0)) - float(clip.get("source_start", 0.0))) for clip in clips)
+        scorecard = pkg.get("genre_scorecard") if isinstance(pkg.get("genre_scorecard"), dict) else {}
 
         lines = [
+            f"업로드 제목: {self.suggest_upload_title(pkg)}",
+            "",
             f"제목 1: {pkg.get('title_line1', '')}",
             f"제목 2: {pkg.get('title_line2', '')}",
             f"출처명: {pkg.get('source_label', '') or pkg.get('source_title', '')}",
@@ -1381,6 +1808,24 @@ class Long2ShortsApp:
             "",
             "컷 구성:",
         ]
+
+        if scorecard:
+            lines.extend(
+                [
+                    "",
+                    f"Genre score: {scorecard.get('total', '-')}/100 ({scorecard.get('decision', '-')})",
+                ]
+            )
+            for item in scorecard.get("dimensions", []) or []:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"  - {item.get('id', '')}: {item.get('score', '')}/{item.get('max_score', '')} | {item.get('reason', '')}"
+                    )
+            for item in scorecard.get("penalties", []) or []:
+                if isinstance(item, dict):
+                    lines.append(
+                        f"  - penalty {item.get('id', '')}: -{item.get('deduction', '')} | {item.get('reason', '')}"
+                    )
 
         for index, clip in enumerate(clips, start=1):
             lines.append(
@@ -1560,6 +2005,10 @@ class Long2ShortsApp:
                     self.status_var.set(str(payload))
                 elif kind == "phase":
                     self.phase_var.set(str(payload))
+                elif kind == "set_youtube_url":
+                    self.youtube_url_var.set(str(payload))
+                elif kind == "set_title":
+                    self.title_var.set(str(payload))
                 elif kind == "error":
                     self.append_log(str(payload))
                     if "작업이 중지" not in str(payload):
@@ -1618,20 +2067,420 @@ class Long2ShortsApp:
             self.root.after(120, self._poll_log_queue)
 
 
+class ShortsDashboardApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("Long2Shorts Studio")
+        self.root.geometry("1280x860")
+        self.root.minsize(1080, 760)
+        self.python_exe = get_python_exe()
+        self.log_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.worker_thread: threading.Thread | None = None
+        self.current_process: subprocess.Popen | None = None
+        self.review_rows: dict[str, dict] = {}
+
+        self.status_var = tk.StringVar(value="대기 중")
+        self.run_note_var = tk.StringVar(value="오늘 쇼츠 제작을 누르면 트렌드 조사부터 검토 대기 등록까지 자동으로 진행합니다.")
+        self.review_note_var = tk.StringVar(value="검토 대기 영상을 선택하세요.")
+        self.stage_vars: dict[str, tk.StringVar] = {}
+        self.stage_note_vars: dict[str, tk.StringVar] = {}
+
+        self.review_tree: ttk.Treeview | None = None
+        self.feedback_text: tk.Text | None = None
+        self.log_text: tk.Text | None = None
+        self.primary_button: tk.Button | None = None
+        self.busy_buttons: list[tk.Widget] = []
+
+        self.configure_style()
+        self.build_ui()
+        self.root.after(100, self.poll_log_queue)
+        self.refresh_reviews()
+
+    def configure_style(self) -> None:
+        self.root.configure(bg="#f4f6fb")
+        style = ttk.Style()
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("Studio.TFrame", background="#f4f6fb")
+        style.configure("Panel.TFrame", background="#ffffff", relief="flat")
+        style.configure("Muted.TLabel", background="#ffffff", foreground="#64748b", font=("Malgun Gothic", 10))
+        style.configure("Title.TLabel", background="#ffffff", foreground="#111827", font=("Malgun Gothic", 18, "bold"))
+        style.configure("Section.TLabel", background="#ffffff", foreground="#111827", font=("Malgun Gothic", 12, "bold"))
+        style.configure("Status.TLabel", background="#111827", foreground="#ffffff", font=("Malgun Gothic", 10, "bold"), padding=(10, 5))
+        style.configure("Treeview", font=("Malgun Gothic", 10), rowheight=28)
+        style.configure("Treeview.Heading", font=("Malgun Gothic", 10, "bold"))
+
+    def build_ui(self) -> None:
+        outer = ttk.Frame(self.root, style="Studio.TFrame", padding=18)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=3)
+        outer.columnconfigure(1, weight=2)
+        outer.rowconfigure(1, weight=1)
+
+        hero = ttk.Frame(outer, style="Panel.TFrame", padding=22)
+        hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
+        hero.columnconfigure(0, weight=1)
+        ttk.Label(hero, text="Long2Shorts Studio", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(hero, textvariable=self.run_note_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.primary_button = tk.Button(
+            hero,
+            text="오늘 쇼츠 제작",
+            command=self.on_daily_run,
+            bg="#111827",
+            fg="#ffffff",
+            activebackground="#1f2937",
+            activeforeground="#ffffff",
+            relief="flat",
+            padx=28,
+            pady=14,
+            font=("Malgun Gothic", 15, "bold"),
+            cursor="hand2",
+        )
+        self.primary_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(18, 0))
+        self.busy_buttons.append(self.primary_button)
+
+        work = ttk.Frame(outer, style="Panel.TFrame", padding=18)
+        work.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
+        work.columnconfigure(0, weight=1)
+        ttk.Label(work, text="진행 상황", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(work, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
+        stage_frame = ttk.Frame(work, style="Panel.TFrame")
+        stage_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 18))
+        stage_frame.columnconfigure(1, weight=1)
+        stages = [
+            ("metrics", "성과 확인", "지난 업로드 성과를 확인합니다."),
+            ("learning", "학습 규칙", "성과와 피드백으로 오늘의 편집 기준을 정합니다."),
+            ("trend", "트렌드 조사", "최근 예능 롱폼 후보를 고릅니다."),
+            ("source", "원본 확보", "선정 롱폼을 다운로드하고 전사를 준비합니다."),
+            ("package", "후보 생성", "AI가 쇼츠 후보를 만들고 점수화합니다."),
+            ("render", "렌더/검토", "MP4를 만들고 검토 대기에 올립니다."),
+        ]
+        for row, (key, title, note) in enumerate(stages):
+            badge = tk.Label(stage_frame, text="대기", width=8, bg="#e5e7eb", fg="#374151", font=("Malgun Gothic", 9, "bold"))
+            badge.grid(row=row, column=0, sticky="nw", pady=5)
+            self.stage_vars[key] = tk.StringVar(value="대기")
+            self.stage_note_vars[key] = tk.StringVar(value=note)
+            label = ttk.Label(stage_frame, text=title, style="Section.TLabel")
+            label.grid(row=row, column=1, sticky="w", padx=(10, 0), pady=(3, 0))
+            note_label = ttk.Label(stage_frame, textvariable=self.stage_note_vars[key], style="Muted.TLabel", wraplength=660)
+            note_label.grid(row=row, column=1, sticky="w", padx=(10, 0), pady=(25, 5))
+            self.stage_vars[key].trace_add("write", self.make_badge_updater(badge, self.stage_vars[key]))
+
+        log_panel = ttk.Frame(work, style="Panel.TFrame")
+        log_panel.grid(row=2, column=0, columnspan=2, sticky="nsew")
+        work.rowconfigure(2, weight=1)
+        ttk.Label(log_panel, text="실행 로그", style="Section.TLabel").pack(anchor="w")
+        self.log_text = tk.Text(log_panel, height=12, wrap="word", bg="#0f172a", fg="#dbeafe", insertbackground="#ffffff", relief="flat", padx=12, pady=10)
+        self.log_text.pack(fill="both", expand=True, pady=(8, 0))
+
+        review = ttk.Frame(outer, style="Panel.TFrame", padding=18)
+        review.grid(row=1, column=1, sticky="nsew")
+        review.columnconfigure(0, weight=1)
+        review.rowconfigure(2, weight=1)
+        ttk.Label(review, text="검토 대기", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(review, textvariable=self.review_note_var, style="Muted.TLabel").grid(row=1, column=0, sticky="ew", pady=(6, 10))
+        columns = ("score", "status", "short", "file")
+        self.review_tree = ttk.Treeview(review, columns=columns, show="headings", height=10)
+        for col, title, width in [
+            ("score", "점수", 58),
+            ("status", "상태", 96),
+            ("short", "ID", 86),
+            ("file", "파일", 260),
+        ]:
+            self.review_tree.heading(col, text=title)
+            self.review_tree.column(col, width=width, anchor="center" if col != "file" else "w")
+        self.review_tree.grid(row=2, column=0, sticky="nsew")
+        self.review_tree.bind("<<TreeviewSelect>>", self.on_review_selected)
+
+        actions = ttk.Frame(review, style="Panel.TFrame")
+        actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        for text, command in [
+            ("새로고침", self.refresh_reviews),
+            ("영상 열기", self.open_selected_review),
+            ("승인", lambda: self.review_decision("approved")),
+            ("내용 수정요청", lambda: self.review_decision("revision_requested")),
+            ("폐기", lambda: self.review_decision("rejected")),
+            ("승인본 업로드", self.upload_approved),
+        ]:
+            button = ttk.Button(actions, text=text, command=command)
+            button.pack(side="left", padx=(0, 6), pady=2)
+            self.busy_buttons.append(button)
+
+        ttk.Label(review, text="내용 피드백", style="Section.TLabel").grid(row=4, column=0, sticky="w", pady=(18, 6))
+        self.feedback_text = tk.Text(review, height=8, wrap="word", bg="#f8fafc", relief="flat", padx=10, pady=8)
+        self.feedback_text.grid(row=5, column=0, sticky="ew")
+        self.feedback_text.insert(
+            "1.0",
+            "예: 소재가 약함, 왜 봐야 하는지 불명확함, 제목이 약속한 장면이 늦게 나옴, 리액션/반전이 부족함",
+        )
+
+        footer = ttk.Frame(outer, style="Studio.TFrame")
+        footer.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        ttk.Label(
+            footer,
+            text="고급 작업은 기존 스크립트와 설정을 그대로 사용합니다. 이 화면은 매일 제작과 검토만 빠르게 처리하도록 정리한 대시보드입니다.",
+            background="#f4f6fb",
+            foreground="#64748b",
+        ).pack(anchor="w")
+
+    def make_badge_updater(self, badge: tk.Label, var: tk.StringVar):
+        def update(*_args) -> None:
+            value = var.get()
+            colors = {
+                "대기": ("#e5e7eb", "#374151"),
+                "진행": ("#dbeafe", "#1d4ed8"),
+                "완료": ("#dcfce7", "#166534"),
+                "검토": ("#fef3c7", "#92400e"),
+                "실패": ("#fee2e2", "#991b1b"),
+            }
+            bg, fg = colors.get(value, ("#f3f4f6", "#374151"))
+            badge.configure(text=value, bg=bg, fg=fg)
+        return update
+
+    def set_stage(self, key: str, status: str, note: str | None = None) -> None:
+        if key in self.stage_vars:
+            self.stage_vars[key].set(status)
+        if note is not None and key in self.stage_note_vars:
+            self.stage_note_vars[key].set(note)
+
+    def reset_stages(self) -> None:
+        defaults = {
+            "metrics": "지난 업로드 성과를 확인합니다.",
+            "learning": "성과와 피드백으로 오늘의 편집 기준을 정합니다.",
+            "trend": "최근 예능 롱폼 후보를 고릅니다.",
+            "source": "선정 롱폼을 다운로드하고 전사를 준비합니다.",
+            "package": "AI가 쇼츠 후보를 만들고 점수화합니다.",
+            "render": "MP4를 만들고 검토 대기에 올립니다.",
+        }
+        for key, note in defaults.items():
+            self.set_stage(key, "대기", note)
+
+    def set_busy(self, busy: bool) -> None:
+        for button in self.busy_buttons:
+            try:
+                button.configure(state="disabled" if busy else "normal")
+            except tk.TclError:
+                pass
+
+    def append_log(self, text: str) -> None:
+        if not self.log_text:
+            return
+        self.log_text.insert("end", text.rstrip() + "\n")
+        self.log_text.see("end")
+
+    def run_worker(self, args: list[str], label: str, on_done=None) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showinfo("작업 중", "이미 실행 중인 작업이 있습니다.")
+            return
+
+        def task() -> None:
+            self.log_queue.put(("busy", True))
+            self.log_queue.put(("status", label))
+            lines: list[str] = []
+            try:
+                process = subprocess.Popen(
+                    args,
+                    cwd=BASE_DIR,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                self.current_process = process
+                assert process.stdout is not None
+                for line in process.stdout:
+                    clean = line.rstrip()
+                    if clean:
+                        lines.append(clean)
+                        self.log_queue.put(("log", clean))
+                        self.log_queue.put(("stage", clean))
+                code = process.wait()
+                if code != 0:
+                    raise RuntimeError(f"{label} 실패 (exit {code})")
+                if on_done:
+                    self.log_queue.put(("done_callback", (on_done, lines)))
+                self.log_queue.put(("status", "완료"))
+            except Exception as exc:
+                self.log_queue.put(("error", str(exc)))
+            finally:
+                self.current_process = None
+                self.log_queue.put(("busy", False))
+
+        self.worker_thread = threading.Thread(target=task, daemon=True)
+        self.worker_thread.start()
+
+    def on_daily_run(self) -> None:
+        self.reset_stages()
+        self.run_note_var.set("트렌드 조사부터 렌더/검토 등록까지 실행 중입니다.")
+        self.run_worker(
+            [str(self.python_exe), "shorts_orchestrator.py", "--config", str(ORCHESTRATOR_CONFIG_PATH), "daily-run", "--execute"],
+            "오늘 쇼츠 제작 중",
+            on_done=lambda _lines: self.refresh_reviews(),
+        )
+
+    def refresh_reviews(self) -> None:
+        def done(lines: list[str]) -> None:
+            raw = "\n".join(lines)
+            try:
+                items = json.loads(raw or "[]")
+            except json.JSONDecodeError:
+                items = []
+            self.populate_reviews(items if isinstance(items, list) else [])
+
+        self.run_worker(
+            [str(self.python_exe), "shorts_orchestrator.py", "--config", str(ORCHESTRATOR_CONFIG_PATH), "list-reviews", "--status", "needs_review", "--limit", "30"],
+            "검토 목록 새로고침 중",
+            on_done=done,
+        )
+
+    def populate_reviews(self, items: list[dict]) -> None:
+        if not self.review_tree:
+            return
+        self.review_rows.clear()
+        for row in self.review_tree.get_children():
+            self.review_tree.delete(row)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            output_path = str(item.get("output_path") or "")
+            iid = output_path or str(item.get("content_sha256") or len(self.review_rows))
+            self.review_rows[iid] = item
+            self.review_tree.insert(
+                "",
+                "end",
+                iid=iid,
+                values=(
+                    item.get("score", ""),
+                    item.get("review_status", ""),
+                    item.get("short_id", ""),
+                    Path(output_path).name if output_path else "",
+                ),
+            )
+        self.review_note_var.set(f"검토 대기 {len(items)}개")
+
+    def selected_review(self) -> dict | None:
+        if not self.review_tree:
+            return None
+        selection = self.review_tree.selection()
+        if not selection:
+            return None
+        return self.review_rows.get(selection[0])
+
+    def on_review_selected(self, _event=None) -> None:
+        item = self.selected_review()
+        if not item:
+            return
+        self.review_note_var.set(f"{Path(str(item.get('output_path') or '')).name} 선택됨")
+
+    def open_selected_review(self) -> None:
+        item = self.selected_review()
+        if not item:
+            messagebox.showinfo("선택 필요", "검토할 영상을 먼저 선택하세요.")
+            return
+        path = Path(str(item.get("output_path") or ""))
+        if not path.exists():
+            messagebox.showerror("파일 없음", str(path))
+            return
+        os.startfile(str(path))
+
+    def review_decision(self, status: str) -> None:
+        item = self.selected_review()
+        if not item:
+            messagebox.showinfo("선택 필요", "검토할 영상을 먼저 선택하세요.")
+            return
+        note = self.feedback_text.get("1.0", "end").strip() if self.feedback_text else ""
+        placeholder = "예: 소재가 약함"
+        if status in {"revision_requested", "rejected"} and (not note or placeholder in note):
+            messagebox.showinfo("피드백 필요", "내용 수정요청/폐기에는 다음 제작에 반영할 피드백을 적어주세요.")
+            return
+        if status == "approved" and placeholder in note:
+            note = "approved"
+        output_path = str(item.get("output_path") or "")
+        self.run_worker(
+            [
+                str(self.python_exe),
+                "shorts_orchestrator.py",
+                "--config",
+                str(ORCHESTRATOR_CONFIG_PATH),
+                "review-decision",
+                "--output",
+                output_path,
+                "--status",
+                status,
+                "--note",
+                note or status,
+            ],
+            "검토 결과 저장 중",
+            on_done=lambda _lines: self.refresh_reviews(),
+        )
+
+    def upload_approved(self) -> None:
+        self.run_worker(
+            [str(self.python_exe), "shorts_orchestrator.py", "--config", str(ORCHESTRATOR_CONFIG_PATH), "upload-approved", "--execute"],
+            "승인본 업로드 중",
+            on_done=lambda _lines: self.refresh_reviews(),
+        )
+
+    def update_stage_from_log(self, line: str) -> None:
+        if line.startswith("[orchestrator] phase=metrics_sync"):
+            self.set_stage("metrics", "진행", "성과 체크 중")
+        elif line.startswith("[orchestrator] phase=learning_rule"):
+            self.set_stage("metrics", "완료")
+            self.set_stage("learning", "진행", "오늘 적용할 편집 규칙 계산 중")
+        elif line.startswith("[orchestrator] phase=trend_research"):
+            self.set_stage("learning", "완료")
+            self.set_stage("trend", "진행", "최근 트렌드 원본 탐색 중")
+        elif line.startswith("[orchestrator] phase=source_acquisition"):
+            self.set_stage("trend", "완료")
+            self.set_stage("source", "진행", "선정 롱폼 다운로드/전사 준비 중")
+        elif line.startswith("[orchestrator] phase=source_analysis"):
+            self.set_stage("source", "진행", line.split("source=", 1)[-1])
+        elif line.startswith("[orchestrator] phase=package_generation"):
+            self.set_stage("source", "완료")
+            self.set_stage("package", "진행", line.split("source=", 1)[-1])
+        elif line.startswith("[orchestrator] phase=render"):
+            self.set_stage("package", "완료")
+            self.set_stage("render", "진행", "템플릿 MP4 렌더 중")
+        elif line.startswith("[orchestrator] phase=review"):
+            self.set_stage("render", "진행", "검토 큐 등록 중")
+        elif line.startswith("[orchestrator] review_item="):
+            self.set_stage("render", "검토", Path(line.split("review_item=", 1)[1].split(" status=", 1)[0]).name)
+        elif line.startswith("[orchestrator] status=completed"):
+            self.status_var.set("완료")
+        elif line.startswith("[orchestrator] status=failed"):
+            self.status_var.set("실패")
+
+    def poll_log_queue(self) -> None:
+        try:
+            while True:
+                kind, payload = self.log_queue.get_nowait()
+                if kind == "busy":
+                    self.set_busy(bool(payload))
+                elif kind == "status":
+                    self.status_var.set(str(payload))
+                elif kind == "log":
+                    self.append_log(str(payload))
+                elif kind == "stage":
+                    self.update_stage_from_log(str(payload))
+                elif kind == "error":
+                    self.status_var.set("실패")
+                    self.append_log(str(payload))
+                    messagebox.showerror("오류", str(payload))
+                elif kind == "done_callback":
+                    callback, lines = payload
+                    callback(lines)
+        except queue.Empty:
+            pass
+        finally:
+            self.root.after(120, self.poll_log_queue)
+
+
 def main() -> None:
+    configure_tcl_library_paths()
     root = tk.Tk()
-    style = ttk.Style()
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
-    app = Long2ShortsApp(root)
-    app.render_youtube_context()
-    app.append_text(
-        app.detail_text,
-        "YouTube 링크를 직접 넣거나 참고 채널 탭에서 최신 영상을 선택하세요.\n\n"
-        "- `참고 채널`: 채널 URL 또는 @핸들을 추가하고 최신 영상 확인\n"
-        "- `다운로드+분석`: 링크 영상을 다운로드하고 댓글/STT 분석\n"
-        "- `쇼츠 시놉시스 생성`: STT와 댓글 신호를 반영해 후보 생성",
-    )
+    ShortsDashboardApp(root)
     root.mainloop()
 
 

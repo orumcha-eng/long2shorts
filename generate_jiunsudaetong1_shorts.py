@@ -4,8 +4,9 @@ import os
 from pathlib import Path
 import unicodedata
 
-from dotenv import load_dotenv
 from openai import OpenAI
+
+from env_loader import format_checked_env_paths, load_project_env
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -13,7 +14,6 @@ ANALYSIS_DIR = BASE_DIR / "analysis" / "jiunsudaetong1"
 TRANSCRIPTS_DIR = ANALYSIS_DIR / "transcripts"
 MERGED_TRANSCRIPT_PATH = ANALYSIS_DIR / "merged" / "merged_transcript.json"
 OUTPUT_DIR = ANALYSIS_DIR / "shorts_candidates"
-ENV_PATH = BASE_DIR.parent / "auto_Youtube" / "shorts" / ".env"
 
 SOURCE_TITLE = "지은수대통 1회"
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -90,10 +90,10 @@ Return JSON only.
 
 
 def load_client() -> OpenAI:
-    load_dotenv(ENV_PATH)
+    load_project_env()
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
-        raise RuntimeError(f"OPENAI_API_KEY not found in {ENV_PATH}")
+        raise RuntimeError(f"OPENAI_API_KEY not found. Checked: {format_checked_env_paths()}")
     return OpenAI(api_key=api_key)
 
 

@@ -22,7 +22,7 @@
       "enabled": true
     },
     "title": {
-      "font_path": "assets/fonts/Jua-Regular.ttf",
+      "font_path": "C:\\Windows\\Fonts\\Pretendard-ExtraBold.ttf",
       "line1": {
         "box": [290, 70, 1040, 165],
         "max_chars": 12,
@@ -34,7 +34,7 @@
       },
       "line2": {
         "box": [80, 245, 1000, 380],
-        "max_chars": 11,
+        "max_chars": 14,
         "image_font_size": 76,
         "min_image_font_size": 56,
         "image_color": "#00E846",
@@ -45,7 +45,7 @@
       }
     },
     "channel": {
-      "font_path": "assets/fonts/Jua-Regular.ttf",
+      "font_path": "C:\\Windows\\Fonts\\Pretendard-ExtraBold.ttf",
       "suffix": "",
       "box": [0, 1515, 1080, 1610],
       "image_font_size": 72,

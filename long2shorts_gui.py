@@ -2109,6 +2109,7 @@ class ShortsDashboardApp:
         style.configure("Status.TLabel", background="#111827", foreground="#ffffff", font=("Malgun Gothic", 10, "bold"), padding=(10, 5))
         style.configure("Treeview", font=("Malgun Gothic", 10), rowheight=28)
         style.configure("Treeview.Heading", font=("Malgun Gothic", 10, "bold"))
+        style.configure("StageTitle.TLabel", background="#ffffff", foreground="#111827", font=("Malgun Gothic", 10, "bold"))
 
     def build_ui(self) -> None:
         outer = ttk.Frame(self.root, style="Studio.TFrame", padding=18)
@@ -2142,10 +2143,11 @@ class ShortsDashboardApp:
         work = ttk.Frame(outer, style="Panel.TFrame", padding=18)
         work.grid(row=1, column=0, sticky="nsew", padx=(0, 14))
         work.columnconfigure(0, weight=1)
+        work.rowconfigure(1, weight=0)
         ttk.Label(work, text="진행 상황", style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(work, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, sticky="e")
         stage_frame = ttk.Frame(work, style="Panel.TFrame")
-        stage_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(14, 18))
+        stage_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", pady=(14, 18))
         stage_frame.columnconfigure(1, weight=1)
         stages = [
             ("metrics", "성과 확인", "지난 업로드 성과를 확인합니다."),
@@ -2157,13 +2159,16 @@ class ShortsDashboardApp:
         ]
         for row, (key, title, note) in enumerate(stages):
             badge = tk.Label(stage_frame, text="대기", width=8, bg="#e5e7eb", fg="#374151", font=("Malgun Gothic", 9, "bold"))
-            badge.grid(row=row, column=0, sticky="nw", pady=5)
+            badge.grid(row=row, column=0, sticky="nw", pady=(4, 8))
             self.stage_vars[key] = tk.StringVar(value="대기")
             self.stage_note_vars[key] = tk.StringVar(value=note)
-            label = ttk.Label(stage_frame, text=title, style="Section.TLabel")
-            label.grid(row=row, column=1, sticky="w", padx=(10, 0), pady=(3, 0))
-            note_label = ttk.Label(stage_frame, textvariable=self.stage_note_vars[key], style="Muted.TLabel", wraplength=660)
-            note_label.grid(row=row, column=1, sticky="w", padx=(10, 0), pady=(25, 5))
+            text_frame = ttk.Frame(stage_frame, style="Panel.TFrame")
+            text_frame.grid(row=row, column=1, sticky="ew", padx=(10, 0), pady=(0, 8))
+            text_frame.columnconfigure(0, weight=1)
+            label = ttk.Label(text_frame, text=title, style="StageTitle.TLabel")
+            label.grid(row=0, column=0, sticky="w")
+            note_label = ttk.Label(text_frame, textvariable=self.stage_note_vars[key], style="Muted.TLabel", wraplength=500)
+            note_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
             self.stage_vars[key].trace_add("write", self.make_badge_updater(badge, self.stage_vars[key]))
 
         log_panel = ttk.Frame(work, style="Panel.TFrame")
@@ -2194,17 +2199,19 @@ class ShortsDashboardApp:
 
         actions = ttk.Frame(review, style="Panel.TFrame")
         actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        for text, command in [
+        for index, (text, command) in enumerate([
             ("새로고침", self.refresh_reviews),
             ("영상 열기", self.open_selected_review),
             ("승인", lambda: self.review_decision("approved")),
             ("내용 수정요청", lambda: self.review_decision("revision_requested")),
             ("폐기", lambda: self.review_decision("rejected")),
             ("승인본 업로드", self.upload_approved),
-        ]:
+        ]):
             button = ttk.Button(actions, text=text, command=command)
-            button.pack(side="left", padx=(0, 6), pady=2)
+            button.grid(row=index // 3, column=index % 3, sticky="ew", padx=(0, 6), pady=2)
             self.busy_buttons.append(button)
+        for col in range(3):
+            actions.columnconfigure(col, weight=1)
 
         ttk.Label(review, text="내용 피드백", style="Section.TLabel").grid(row=4, column=0, sticky="w", pady=(18, 6))
         self.feedback_text = tk.Text(review, height=8, wrap="word", bg="#f8fafc", relief="flat", padx=10, pady=8)
@@ -2231,6 +2238,7 @@ class ShortsDashboardApp:
                 "진행": ("#dbeafe", "#1d4ed8"),
                 "완료": ("#dcfce7", "#166534"),
                 "검토": ("#fef3c7", "#92400e"),
+                "보류": ("#f3f4f6", "#6b7280"),
                 "실패": ("#fee2e2", "#991b1b"),
             }
             bg, fg = colors.get(value, ("#f3f4f6", "#374151"))
@@ -2317,8 +2325,62 @@ class ShortsDashboardApp:
         self.run_worker(
             [str(self.python_exe), "shorts_orchestrator.py", "--config", str(ORCHESTRATOR_CONFIG_PATH), "daily-run", "--execute"],
             "오늘 쇼츠 제작 중",
-            on_done=lambda _lines: self.refresh_reviews(),
+            on_done=self.on_daily_run_done,
         )
+
+    def on_daily_run_done(self, lines: list[str]) -> None:
+        self.apply_daily_summary_feedback(lines)
+        self.refresh_reviews()
+
+    def apply_daily_summary_feedback(self, lines: list[str]) -> None:
+        summary_path: Path | None = None
+        for line in lines:
+            if line.startswith("[orchestrator] summary="):
+                summary_path = Path(line.split("=", 1)[1].strip())
+                break
+        if not summary_path or not summary_path.exists():
+            return
+
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self.append_log(f"[gui] 실행 요약을 읽지 못했습니다: {exc}")
+            return
+
+        sources = [item for item in summary.get("sources", []) or [] if isinstance(item, dict)]
+        review_count = 0
+        rendered_count = 0
+        blocked_notes: list[str] = []
+        for source in sources:
+            analysis = source.get("analysis", {}) if isinstance(source.get("analysis"), dict) else {}
+            if analysis and analysis.get("status") != "ready":
+                reason = str(analysis.get("reason") or analysis.get("status") or "원본 분석이 준비되지 않음")
+                blocked_notes.append(reason)
+            render = source.get("render", {}) if isinstance(source.get("render"), dict) else {}
+            rendered_count += len([item for item in render.get("rendered", []) or [] if isinstance(item, dict) and item.get("status") == "completed"])
+            review = source.get("review", {}) if isinstance(source.get("review"), dict) else {}
+            review_count += len([item for item in review.get("items", []) or [] if isinstance(item, dict)])
+
+        if review_count:
+            self.status_var.set("검토 대기")
+            self.run_note_var.set(f"쇼츠 {review_count}개가 검토 대기에 등록됐습니다.")
+            self.set_stage("render", "검토", f"검토 대기 {review_count}개 등록")
+            return
+
+        if blocked_notes:
+            note = blocked_notes[0]
+            self.status_var.set("제작 보류")
+            self.run_note_var.set("자동 실행은 끝났지만 렌더/검토 등록까지 가지 못했습니다.")
+            self.set_stage("source", "보류", note)
+            self.set_stage("package", "보류", "원본 분석이 준비되지 않아 후보 생성을 건너뜀")
+            self.set_stage("render", "보류", "검토 대기에 등록된 MP4가 없습니다.")
+            self.append_log(f"[gui] 검토 대기 등록 없음: {note}")
+            return
+
+        if rendered_count == 0:
+            self.status_var.set("제작 없음")
+            self.run_note_var.set("자동 실행은 끝났지만 렌더된 쇼츠가 없어 검토 대기가 비어 있습니다.")
+            self.set_stage("render", "보류", "렌더된 MP4가 없습니다.")
 
     def refresh_reviews(self) -> None:
         def done(lines: list[str]) -> None:
@@ -2358,7 +2420,10 @@ class ShortsDashboardApp:
                     Path(output_path).name if output_path else "",
                 ),
             )
-        self.review_note_var.set(f"검토 대기 {len(items)}개")
+        if items:
+            self.review_note_var.set(f"검토 대기 {len(items)}개")
+        else:
+            self.review_note_var.set("검토 대기 0개 - 아직 등록된 쇼츠가 없습니다.")
 
     def selected_review(self) -> dict | None:
         if not self.review_tree:
@@ -2435,6 +2500,8 @@ class ShortsDashboardApp:
         elif line.startswith("[orchestrator] phase=source_acquisition"):
             self.set_stage("trend", "완료")
             self.set_stage("source", "진행", "선정 롱폼 다운로드/전사 준비 중")
+        elif line.startswith("[orchestrator] source_attempt="):
+            self.set_stage("source", "진행", line.split("=", 1)[1])
         elif line.startswith("[orchestrator] phase=source_analysis"):
             self.set_stage("source", "진행", line.split("source=", 1)[-1])
         elif line.startswith("[orchestrator] phase=package_generation"):

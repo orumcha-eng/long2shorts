@@ -37,7 +37,7 @@ OPENAI_REQUEST_TIMEOUT_SEC = 120.0
 OPENAI_SDK_MAX_RETRIES = 1
 BENCHMARK_CHUNK_TOP_K = 5
 BENCHMARK_FINAL_TOP_K = 8
-BENCHMARK_LOCAL_MAX_COMPLETION_TOKENS = 4_800
+BENCHMARK_LOCAL_MAX_COMPLETION_TOKENS = 8_000
 GLOBAL_MAX_COMPLETION_TOKENS = 2_400
 PACKAGING_MAX_COMPLETION_TOKENS = 4_800
 WIDE_WINDOW_GROUP_SIZE = 2
@@ -900,14 +900,23 @@ def model_json_validated(
     prompt = user_prompt
     last_error = ""
     for _ in range(MAX_RETRIES):
-        result = model_json(
-            client,
-            model,
-            system_prompt,
-            prompt,
-            temperature=temperature,
-            max_completion_tokens=max_completion_tokens,
-        )
+        try:
+            result = model_json(
+                client,
+                model,
+                system_prompt,
+                prompt,
+                temperature=temperature,
+                max_completion_tokens=max_completion_tokens,
+            )
+        except RuntimeError as exc:
+            last_error = str(exc)
+            prompt = (
+                user_prompt
+                + "\n\nYour previous response was not valid JSON or was truncated.\n"
+                + "Return a smaller valid JSON object only. Prefer fewer, stronger candidates over a long response."
+            )
+            continue
         ok, message = validator(result)
         if ok:
             return result

@@ -48,6 +48,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "captions_only": False,
         "download_dir": "downloads",
         "max_comments": 300,
+        "max_attempts": 5,
         "mark_processed_after_render": True,
     },
     "benchmark_profile": DEFAULT_BENCHMARK_PROFILE,
@@ -58,7 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "production": {
         "enabled": True,
-        "max_packages_per_source": 1,
+        "max_packages_per_source": "auto",
         "minimum_score": 85,
         "allowed_decisions": ["auto_render"],
     },
@@ -354,6 +355,65 @@ def read_source_video(entry: dict[str, Any], analysis_dir: Path) -> Path | None:
     return None
 
 
+def read_source_duration_sec(source: dict[str, Any]) -> float:
+    for value in [source.get("duration_sec"), source.get("source_duration_sec")]:
+        try:
+            duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            return duration
+
+    analysis_dir = source.get("analysis_dir")
+    if not isinstance(analysis_dir, Path):
+        analysis_dir = resolve_path(analysis_dir)
+    if not analysis_dir:
+        return 0.0
+
+    context = read_json(analysis_dir / "youtube_context.json", {})
+    metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+    for value in [metadata.get("duration_sec") if isinstance(metadata, dict) else None]:
+        try:
+            duration = float(value)
+        except (TypeError, ValueError):
+            continue
+        if duration > 0:
+            return duration
+
+    job_metadata = read_json(analysis_dir / "job_metadata.json", {})
+    if isinstance(job_metadata, dict):
+        try:
+            duration = float(job_metadata.get("duration_sec") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+        if duration > 0:
+            return duration
+    return 0.0
+
+
+def max_render_count_for_duration(duration_sec: float) -> int:
+    minutes = duration_sec / 60.0 if duration_sec > 0 else 0.0
+    if minutes >= 60:
+        return 5
+    if minutes >= 40:
+        return 4
+    if minutes >= 20:
+        return 3
+    if minutes >= 10:
+        return 2
+    return 1
+
+
+def production_render_limit(production: dict[str, Any], source: dict[str, Any]) -> int:
+    configured = production.get("max_packages_per_source", "auto")
+    if isinstance(configured, str) and configured.strip().lower() == "auto":
+        return max_render_count_for_duration(read_source_duration_sec(source))
+    try:
+        return max(1, int(configured or 1))
+    except (TypeError, ValueError):
+        return max_render_count_for_duration(read_source_duration_sec(source))
+
+
 def normalized_tokens(value: str) -> set[str]:
     return {
         token.casefold()
@@ -440,6 +500,7 @@ def configured_sources(config: dict[str, Any], library_dirs: list[Path]) -> list
                 "analysis_dir": analysis_dir,
                 "source_video": source_video,
                 "source_title": read_source_title(raw_entry, analysis_dir),
+                "duration_sec": raw_entry.get("duration_sec") or raw_entry.get("source_duration_sec") or 0,
                 "owned": owned,
                 "active": active,
                 "priority": int(raw_entry.get("priority", 0) or 0),
@@ -504,17 +565,32 @@ def run_trend_research(
 
 
 def selected_trend_candidate(trend_result: dict[str, Any]) -> dict[str, Any] | None:
+    candidates = trend_candidate_attempts(trend_result)
+    return candidates[0] if candidates else None
+
+
+def trend_candidate_attempts(trend_result: dict[str, Any]) -> list[dict[str, Any]]:
     snapshot = trend_result.get("snapshot", {}) if isinstance(trend_result.get("snapshot"), dict) else {}
+    attempts: list[dict[str, Any]] = []
+    seen_video_ids: set[str] = set()
+
+    def add_candidate(item) -> None:
+        if not isinstance(item, dict) or not item.get("source_url"):
+            return
+        video_id = str(item.get("video_id") or item.get("source_url") or "").strip()
+        if not video_id or video_id in seen_video_ids:
+            return
+        seen_video_ids.add(video_id)
+        attempts.append(item)
+
     selected = snapshot.get("selected") if isinstance(snapshot.get("selected"), dict) else None
-    if selected and selected.get("source_url"):
-        return selected
+    add_candidate(selected)
     for item in snapshot.get("candidates", []) or []:
-        if isinstance(item, dict) and item.get("status") == "green" and item.get("source_url"):
-            return item
+        if isinstance(item, dict) and item.get("status") == "green":
+            add_candidate(item)
     for item in snapshot.get("candidates", []) or []:
-        if isinstance(item, dict) and item.get("source_url"):
-            return item
-    return None
+        add_candidate(item)
+    return attempts
 
 
 def trend_source_summary(source: dict[str, Any]) -> dict[str, Any]:
@@ -535,6 +611,10 @@ def acquired_source_from_context(
     context: dict[str, Any],
 ) -> dict[str, Any]:
     metadata = context.get("metadata", {}) if isinstance(context.get("metadata"), dict) else {}
+    try:
+        duration_sec = float(metadata.get("duration_sec") or candidate.get("duration_sec") or 0.0)
+    except (TypeError, ValueError):
+        duration_sec = 0.0
     downloaded_video = resolve_path(context.get("downloaded_video"))
     title = first_string(
         candidate.get("title"),
@@ -548,6 +628,7 @@ def acquired_source_from_context(
         "source_video": downloaded_video if downloaded_video and downloaded_video.exists() else None,
         "source_title": title,
         "source_url": str(candidate.get("source_url") or context.get("source_url") or ""),
+        "duration_sec": duration_sec,
         "source_origin": "trend_acquisition",
         "owned": True,
         "active": True,
@@ -567,58 +648,86 @@ def acquire_selected_trend_source(
         return {"status": "disabled"}
     if str(acquisition.get("strategy") or "selected_trend") != "selected_trend":
         return {"status": "disabled", "reason": "unsupported acquisition strategy"}
-    candidate = selected_trend_candidate(trend_result)
-    if not candidate:
+    candidates = trend_candidate_attempts(trend_result)
+    if not candidates:
         return {"status": "no_selected_trend_source"}
-    source_url = str(candidate.get("source_url") or "").strip()
-    video_id = str(candidate.get("video_id") or "").strip()
-    if not source_url or not video_id:
-        return {"status": "invalid_selected_trend_source", "candidate": candidate}
+    max_attempts = max(1, int(acquisition.get("max_attempts", 5) or 5))
+    attempts: list[dict[str, Any]] = []
 
-    analysis_dir = BASE_DIR / "analysis" / f"youtube_{video_id}"
-    context_path = analysis_dir / "youtube_context.json"
-    if not execute:
-        context = read_json(context_path, {}) if context_path.exists() else {}
-        source = acquired_source_from_context(candidate=candidate, analysis_dir=analysis_dir, context=context if isinstance(context, dict) else {})
-        return {"status": "planned", "source": source, "summary": trend_source_summary(source)}
+    for candidate in candidates[:max_attempts]:
+        source_url = str(candidate.get("source_url") or "").strip()
+        video_id = str(candidate.get("video_id") or "").strip()
+        if not source_url or not video_id:
+            attempts.append({"status": "invalid", "candidate": candidate})
+            continue
 
-    command = [
-        sys.executable,
-        "-u",
-        str(BASE_DIR / "collect_youtube_context.py"),
-        "--url",
-        source_url,
-        "--output-dir",
-        str(analysis_dir),
-        "--download-dir",
-        str(resolve_path(acquisition.get("download_dir")) or (BASE_DIR / "downloads")),
-        "--max-comments",
-        str(int(acquisition.get("max_comments", 300) or 300)),
-    ]
-    if bool(acquisition.get("download_video", True)):
-        command.append("--download-video")
-    if bool(acquisition.get("prepare_transcript", True)):
-        command.append("--prepare-transcript")
-    if bool(acquisition.get("captions_only", False)):
-        command.append("--captions-only")
+        analysis_dir = BASE_DIR / "analysis" / f"youtube_{video_id}"
+        context_path = analysis_dir / "youtube_context.json"
+        if not execute:
+            context = read_json(context_path, {}) if context_path.exists() else {}
+            source = acquired_source_from_context(candidate=candidate, analysis_dir=analysis_dir, context=context if isinstance(context, dict) else {})
+            return {"status": "planned", "source": source, "summary": trend_source_summary(source)}
 
-    completed = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if completed.returncode != 0:
-        return {
-            "status": "failed",
-            "error": completed.stderr.strip() or completed.stdout.strip(),
+        command = [
+            sys.executable,
+            "-u",
+            str(BASE_DIR / "collect_youtube_context.py"),
+            "--url",
+            source_url,
+            "--output-dir",
+            str(analysis_dir),
+            "--download-dir",
+            str(resolve_path(acquisition.get("download_dir")) or (BASE_DIR / "downloads")),
+            "--max-comments",
+            str(int(acquisition.get("max_comments", 300) or 300)),
+        ]
+        if bool(acquisition.get("download_video", True)):
+            command.append("--download-video")
+        if bool(acquisition.get("prepare_transcript", True)):
+            command.append("--prepare-transcript")
+        if bool(acquisition.get("captions_only", False)):
+            command.append("--captions-only")
+
+        print(f"[orchestrator] source_attempt={source_url}", flush=True)
+        completed = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        attempt = {
+            "status": "completed" if completed.returncode == 0 else "failed",
             "candidate": candidate,
+            "analysis_dir": str(analysis_dir),
+            "log_tail": completed.stdout.splitlines()[-12:],
         }
-    context = read_json(context_path, {})
-    if not isinstance(context, dict):
-        return {"status": "failed", "error": "youtube_context.json was not created", "candidate": candidate}
-    source = acquired_source_from_context(candidate=candidate, analysis_dir=analysis_dir, context=context)
+        if completed.returncode != 0:
+            attempt["error"] = completed.stderr.strip() or completed.stdout.strip()
+            attempts.append(attempt)
+            continue
+
+        context = read_json(context_path, {})
+        if not isinstance(context, dict):
+            attempt["status"] = "failed"
+            attempt["error"] = "youtube_context.json was not created"
+            attempts.append(attempt)
+            continue
+
+        source = acquired_source_from_context(candidate=candidate, analysis_dir=analysis_dir, context=context)
+        attempt["summary"] = trend_source_summary(source)
+        attempts.append(attempt)
+        if source.get("ready") or source.get("source_video"):
+            return {
+                "status": "completed",
+                "source": source,
+                "summary": trend_source_summary(source),
+                "context_path": str(context_path),
+                "attempts": attempts,
+                "log_tail": completed.stdout.splitlines()[-16:],
+            }
+
+        attempt["status"] = "unusable"
+        attempt["reason"] = "missing merged transcript and source video"
+
     return {
-        "status": "completed",
-        "source": source,
-        "summary": trend_source_summary(source),
-        "context_path": str(context_path),
-        "log_tail": completed.stdout.splitlines()[-16:],
+        "status": "failed",
+        "error": "No trend candidate could be downloaded or transcribed.",
+        "attempts": attempts,
     }
 
 
@@ -1206,7 +1315,7 @@ def render_for_source(
         return {"status": "missing_output", "path": str(aggregate_path)}
 
     minimum_score = int(production.get("minimum_score", 85) or 0)
-    maximum = max(1, int(production.get("max_packages_per_source", 1) or 1))
+    maximum = production_render_limit(production, source)
     allowed_decisions = {str(value) for value in production.get("allowed_decisions", ["auto_render"]) or []}
     selected: list[dict[str, Any]] = []
     for package in sorted(

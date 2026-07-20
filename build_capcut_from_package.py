@@ -17,7 +17,9 @@ from pymediainfo import MediaInfo
 from env_loader import format_checked_env_paths, load_project_env
 
 
-DRAFT_ROOT = Path(r"C:\Users\user\AppData\Local\CapCut\User Data\Projects\com.lveditor.draft")
+LOCALAPPDATA_DIR = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+CAPCUT_USER_DATA_DIR = LOCALAPPDATA_DIR / "CapCut" / "User Data"
+DRAFT_ROOT = CAPCUT_USER_DATA_DIR / "Projects" / "com.lveditor.draft"
 ROOT_META_PATH = DRAFT_ROOT / "root_meta_info.json"
 BASE_DIR = Path(__file__).resolve().parent
 AUDIO_CACHE_DIR = BASE_DIR / "generated_audio"
@@ -28,8 +30,12 @@ LEGACY_JUA_FONT = FONT_DIR / "Jua-Regular.ttf"
 TEXT_OVERLAY_RENDER_VERSION = 4
 REFERENCE_CAPCUT_FONT_ID = "7577600442964725008"
 REFERENCE_CAPCUT_FONT_PATH = Path(
-    r"C:\Users\user\AppData\Local\CapCut\User Data\Cache\effect"
-    r"\7577600442964725008\c1431e2eae4fe955caa6f71a7d60e08f\font.ttf"
+    CAPCUT_USER_DATA_DIR
+    / "Cache"
+    / "effect"
+    / "7577600442964725008"
+    / "c1431e2eae4fe955caa6f71a7d60e08f"
+    / "font.ttf"
 )
 DEFAULT_TEMPLATE_IMAGE = BASE_DIR / "templates" / "shorts_template.png"
 DEFAULT_TEMPLATE_IMAGE_CANDIDATES = [

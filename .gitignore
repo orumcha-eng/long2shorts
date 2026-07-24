@@ -25,4 +25,5 @@ hitomi_downloaded_youtube/
 .env
 automation_config.json
 secrets/
+client_secret_*.json
 reference_channels.json

@@ -27,6 +27,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "window_hours": 72,
     "candidate_limit": 20,
     "search_results_per_query": 20,
+    "video_category_ids": ["24", "23"],
+    "minimum_selection_score": 100,
     "min_duration_sec": 8 * 60,
     "max_duration_sec": 2 * 60 * 60,
     "region_code": "KR",
@@ -218,7 +220,7 @@ def collect_ids_from_api(config: dict[str, Any], api_key: str, published_after: 
     language = str(config.get("language") or "ko")
     max_results = max(1, min(50, int(config.get("search_results_per_query") or 20)))
 
-    for category_id in ["24", "23"]:
+    for category_id in config.get("video_category_ids", ["24", "23"]) or []:
         try:
             data = youtube_api_get(
                 "videos",
@@ -282,6 +284,65 @@ def fetch_video_details_api(ids: list[str], api_key: str) -> list[dict[str, Any]
         )
         items.extend(data.get("items", []) or [])
     return items
+
+
+def collect_recent_longform_from_chart_channels(
+    seed_items: list[dict[str, Any]],
+    config: dict[str, Any],
+    api_key: str,
+) -> list[dict[str, Any]]:
+    """Find recent longform uploads from channels that are hot in the chart.
+
+    ``videos.list(chart=mostPopular)`` is often dominated by Shorts.  This
+    expands only from those chart channels, rather than inventing keyword
+    searches, then lets the same category/date/engagement ranking decide.
+    """
+    channel_ids: list[str] = []
+    seen_channels: set[str] = set()
+    channel_limit = max(1, min(50, int(config.get("longform_channel_seed_limit") or 30)))
+    for item in seed_items:
+        snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
+        channel_id = str(snippet.get("channelId") or "")
+        if channel_id and channel_id not in seen_channels:
+            seen_channels.add(channel_id)
+            channel_ids.append(channel_id)
+        if len(channel_ids) >= channel_limit:
+            break
+    if not channel_ids:
+        return []
+
+    uploads_playlists: list[str] = []
+    for group in batched(channel_ids, 50):
+        data = youtube_api_get(
+            "channels",
+            {"part": "contentDetails", "id": ",".join(group), "maxResults": 50},
+            api_key,
+        )
+        for channel in data.get("items", []) or []:
+            playlist_id = str(
+                (channel.get("contentDetails") or {}).get("relatedPlaylists", {}).get("uploads") or ""
+            )
+            if playlist_id:
+                uploads_playlists.append(playlist_id)
+
+    video_ids: list[str] = []
+    seen_video_ids: set[str] = set()
+    for playlist_id in uploads_playlists:
+        try:
+            data = youtube_api_get(
+                "playlistItems",
+                {"part": "contentDetails", "playlistId": playlist_id, "maxResults": 50},
+                api_key,
+            )
+        except Exception as exc:
+            print(f"[trend] uploads_playlist_error={playlist_id}:{exc}", flush=True)
+            continue
+        for item in data.get("items", []) or []:
+            video_id = str((item.get("contentDetails") or {}).get("videoId") or "")
+            if video_id and video_id not in seen_video_ids:
+                seen_video_ids.add(video_id)
+                video_ids.append(video_id)
+    return fetch_video_details_api(video_ids, api_key)
 
 
 def yt_dlp_json(args: list[str]) -> dict[str, Any] | None:
@@ -375,6 +436,8 @@ def classify_candidate(candidate: dict[str, Any], config: dict[str, Any], histor
     video_id = str(candidate.get("video_id") or "")
     duration_sec = safe_int(candidate.get("duration_sec"))
     age_hours = float(candidate.get("age_hours") or 9999)
+    allowed_categories = {str(value) for value in config.get("video_category_ids", []) or []}
+    category_id = str(candidate.get("category_id") or "")
 
     if video_id in (history.get("processed_sources") or {}):
         return "processed", ["이미 처리한 원본"]
@@ -384,6 +447,12 @@ def classify_candidate(candidate: dict[str, Any], config: dict[str, Any], histor
         return "red", ["길이가 너무 김"]
     if age_hours > float(config.get("window_hours") or 72):
         return "red", ["최근성 기준 초과"]
+    if allowed_categories and category_id not in allowed_categories:
+        return "red", ["카테고리 기준 제외"]
+    if contains_any(title, list(config.get("excluded_title_keywords") or [])):
+        return "red", ["excluded title keyword"]
+    if contains_any(channel, list(config.get("excluded_channel_keywords") or [])):
+        return "red", ["excluded channel keyword"]
     if contains_any(combined, list(config.get("skip_title_keywords") or [])):
         return "red", ["라이브/예고/티저성 제목"]
     if contains_any(title, list(config.get("block_title_keywords") or [])):
@@ -403,30 +472,17 @@ def classify_candidate(candidate: dict[str, Any], config: dict[str, Any], histor
 
 
 def score_candidate(candidate: dict[str, Any], status: str) -> float:
-    age_hours = max(1.0, float(candidate.get("age_hours") or 1.0))
     views = safe_int(candidate.get("view_count"))
     likes = safe_int(candidate.get("like_count"))
     comments = safe_int(candidate.get("comment_count"))
-    duration_sec = safe_int(candidate.get("duration_sec"))
-
-    views_per_hour = views / age_hours
-    comments_per_hour = comments / age_hours
-    like_rate = likes / max(1, views)
-    comment_rate = comments / max(1, views)
-    duration_bonus = 8.0 if 12 * 60 <= duration_sec <= 75 * 60 else 3.0
-    trust_bonus = 15.0 if status == "green" else 0.0
-    recency_bonus = max(0.0, 24.0 - age_hours * 0.25)
-
-    return round(
-        math.log1p(views_per_hour) * 9.0
-        + math.log1p(comments_per_hour) * 14.0
-        + min(12.0, like_rate * 600.0)
-        + min(12.0, comment_rate * 2500.0)
-        + duration_bonus
-        + trust_bonus
-        + recency_bonus,
-        3,
-    )
+    age_hours = max(0.0, float(candidate.get("age_hours") or 0.0))
+    if age_hours < 24:
+        recency_weight = 3
+    elif age_hours < 48:
+        recency_weight = 2
+    else:
+        recency_weight = 1
+    return float((views + likes * 20 + comments * 100) * recency_weight)
 
 
 def normalize_video_item(item: dict[str, Any], now: datetime) -> dict[str, Any] | None:
@@ -447,6 +503,7 @@ def normalize_video_item(item: dict[str, Any], now: datetime) -> dict[str, Any] 
         "title": snippet.get("title") or "",
         "channel_title": snippet.get("channelTitle") or "",
         "channel_id": snippet.get("channelId") or "",
+        "category_id": str(snippet.get("categoryId") or ""),
         "published_at": published_at.isoformat(),
         "age_hours": round(age_hours, 2),
         "duration_sec": duration_sec,
@@ -471,6 +528,11 @@ def discover_candidates(
     if api_key:
         ids = collect_ids_from_api(config, api_key, published_after)
         raw_items = fetch_video_details_api(ids, api_key)
+        if bool(config.get("expand_chart_channels", True)):
+            try:
+                raw_items.extend(collect_recent_longform_from_chart_channels(raw_items, config, api_key))
+            except Exception as exc:
+                print(f"[trend] longform_channel_expansion_error={exc}", flush=True)
     else:
         raw_items = collect_items_from_ytdlp(config, published_after)
 
@@ -491,15 +553,24 @@ def discover_candidates(
         else:
             rejected.append(candidate)
 
-    candidates.sort(key=lambda value: (value["status"] == "green", value["score"]), reverse=True)
+    # Candidate order intentionally uses only current public response, with
+    # 3x/2x/1x weight for videos published within 24/48/72 hours.
+    candidates.sort(key=lambda value: value["score"], reverse=True)
     limit = max(1, int(config.get("candidate_limit") or 20))
-    selected = next((item for item in candidates if item.get("status") == "green"), None)
+    minimum_selection_score = float(config.get("minimum_selection_score") or 0)
+    minimum_production_duration = max(1, int(config.get("minimum_production_source_duration_sec") or 480))
+    production_candidates = [
+        item for item in candidates if safe_int(item.get("duration_sec")) >= minimum_production_duration
+    ]
+    selected = next((item for item in candidates if float(item.get("score") or 0) >= minimum_selection_score), None)
     return {
         "created_at": now.isoformat(),
         "source": source,
         "window_hours": window_hours,
         "candidate_limit": limit,
+        "minimum_selection_score": minimum_selection_score,
         "candidates": candidates[:limit],
+        "production_candidates": production_candidates[:limit],
         "rejected_count": len(rejected),
         "selected": selected,
     }

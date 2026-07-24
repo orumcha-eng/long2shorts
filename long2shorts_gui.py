@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 import tkinter as tk
@@ -1077,6 +1078,7 @@ class Long2ShortsApp:
     @staticmethod
     def package_genre_score(pkg: dict) -> tuple[str, str]:
         scorecard = pkg.get("genre_scorecard") if isinstance(pkg.get("genre_scorecard"), dict) else {}
+        experiment = pkg.get("experiment") if isinstance(pkg.get("experiment"), dict) else {}
         if not scorecard:
             return "-", "-"
         return str(scorecard.get("total", "-")), str(scorecard.get("decision", "-"))
@@ -1149,6 +1151,9 @@ class Long2ShortsApp:
             config = json.loads(ORCHESTRATOR_CONFIG_PATH.read_text(encoding="utf-8"))
         except Exception:
             return False
+        safety = config.get("source_safety", {}) if isinstance(config.get("source_safety"), dict) else {}
+        if bool(safety.get("enabled", True)) and bool(safety.get("require_verified_owned_source", False)):
+            return False
         acquisition = config.get("source_acquisition", {}) if isinstance(config.get("source_acquisition"), dict) else {}
         return bool(acquisition.get("enabled", False))
 
@@ -1156,7 +1161,8 @@ class Long2ShortsApp:
         if not self.has_daily_source_strategy():
             messagebox.showwarning(
                 "소스 설정 필요",
-                "트렌드 원본 자동 선정 또는 내 롱폼 라이브러리 중 하나가 활성화되어야 합니다.",
+                "권리 확인된 내 롱폼을 먼저 라이브러리에 등록해야 합니다.\n"
+                "상단의 ‘내 롱폼’에서 파일을 고른 뒤 ‘라이브러리 등록’을 눌러주세요.",
             )
             self.log_queue.put(("status", "소스 설정 대기 중"))
             return
@@ -1851,6 +1857,18 @@ class Long2ShortsApp:
             lines.append("  - 없음")
 
         lines.append("")
+        lines.append("편집 실험:")
+        if experiment:
+            lines.append(f"  - 가설: {experiment.get('hypothesis', '')}")
+            lines.append(f"  - 핵심 변수: {experiment.get('primary_variable', '')}")
+            for choice in safe_list(experiment.get("choices")):
+                if isinstance(choice, dict):
+                    lines.append(f"  - {choice.get('area', '')}: {choice.get('decision', '')} ({choice.get('reason', '')})")
+            lines.append(f"  - 확인 지표: {experiment.get('success_signal', '')}")
+        else:
+            lines.append("  - 이번 후보에는 아직 실험 기록이 없습니다.")
+
+        lines.append("")
         lines.append("편집 메모:")
         for note in safe_list(pkg.get("edit_notes")):
             lines.append(f"  - {note}")
@@ -2078,6 +2096,7 @@ class ShortsDashboardApp:
         self.worker_thread: threading.Thread | None = None
         self.current_process: subprocess.Popen | None = None
         self.review_rows: dict[str, dict] = {}
+        self.youtube_connection_var = tk.StringVar(value="YouTube: check connection and prior-video performance.")
 
         self.status_var = tk.StringVar(value="대기 중")
         self.run_note_var = tk.StringVar(value="오늘 쇼츠 제작을 누르면 트렌드 조사부터 검토 대기 등록까지 자동으로 진행합니다.")
@@ -2121,6 +2140,12 @@ class ShortsDashboardApp:
         hero = ttk.Frame(outer, style="Panel.TFrame", padding=22)
         hero.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 14))
         hero.columnconfigure(0, weight=1)
+        youtube_row = ttk.Frame(hero, style="Panel.TFrame")
+        youtube_row.grid(row=2, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(youtube_row, textvariable=self.youtube_connection_var, style="Muted.TLabel").pack(side="left")
+        youtube_button = ttk.Button(youtube_row, text="YouTube 성과 확인", command=self.refresh_youtube_connection)
+        youtube_button.pack(side="left", padx=(10, 0))
+        self.busy_buttons.append(youtube_button)
         ttk.Label(hero, text="Long2Shorts Studio", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(hero, textvariable=self.run_note_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
         self.primary_button = tk.Button(
@@ -2137,7 +2162,7 @@ class ShortsDashboardApp:
             font=("Malgun Gothic", 15, "bold"),
             cursor="hand2",
         )
-        self.primary_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(18, 0))
+        self.primary_button.grid(row=0, column=1, rowspan=3, sticky="e", padx=(18, 0))
         self.busy_buttons.append(self.primary_button)
 
         work = ttk.Frame(outer, style="Panel.TFrame", padding=18)
@@ -2212,6 +2237,11 @@ class ShortsDashboardApp:
             self.busy_buttons.append(button)
         for col in range(3):
             actions.columnconfigure(col, weight=1)
+        ttk.Label(
+            actions,
+            text="업로드: KST 09·12·15·18·21시 고정 · 마지막 예약 뒤 다음 슬롯부터 · 출처 자동 표기",
+            style="Muted.TLabel",
+        ).grid(row=2, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
         ttk.Label(review, text="내용 피드백", style="Section.TLabel").grid(row=4, column=0, sticky="w", pady=(18, 6))
         self.feedback_text = tk.Text(review, height=8, wrap="word", bg="#f8fafc", relief="flat", padx=10, pady=8)
@@ -2306,6 +2336,9 @@ class ShortsDashboardApp:
                         self.log_queue.put(("stage", clean))
                 code = process.wait()
                 if code != 0:
+                    detail = "\n".join(lines[-20:]).strip()
+                    if detail:
+                        raise RuntimeError(f"{label} 실패 (exit {code})\n\n{detail}")
                     raise RuntimeError(f"{label} 실패 (exit {code})")
                 if on_done:
                     self.log_queue.put(("done_callback", (on_done, lines)))
@@ -2331,6 +2364,46 @@ class ShortsDashboardApp:
     def on_daily_run_done(self, lines: list[str]) -> None:
         self.apply_daily_summary_feedback(lines)
         self.refresh_reviews()
+
+    def refresh_youtube_connection(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.root.after(500, self.refresh_youtube_connection)
+            return
+
+        def done(lines: list[str]) -> None:
+            try:
+                result = json.loads("\n".join(lines) or "{}")
+            except json.JSONDecodeError:
+                self.youtube_connection_var.set("YouTube: unable to read the connection response.")
+                self.set_stage("metrics", "실패", "유튜브 응답을 읽지 못했습니다.")
+                return
+            if result.get("status") == "connected":
+                channel = str(result.get("channel_title") or "연결된 채널")
+                sync = result.get("metrics_sync", {}) if isinstance(result.get("metrics_sync"), dict) else {}
+                synced = int(sync.get("synced", 0) or 0)
+                tracking = result.get("metrics_tracking", {}) if isinstance(result.get("metrics_tracking"), dict) else {}
+                tracked = int(tracking.get("tracked_count", 0) or 0)
+                next_check = str(tracking.get("next_check_at") or "")
+                next_label = "예정 없음"
+                if next_check:
+                    try:
+                        next_local = datetime.fromisoformat(next_check).astimezone(timezone(timedelta(hours=9)))
+                        next_label = next_local.strftime("%H:%M KST")
+                    except ValueError:
+                        next_label = next_check
+                self.youtube_connection_var.set(
+                    f"YouTube 연결됨: {channel} · 추적 {tracked}개 · 이번 점검 {synced}건 · 다음 {next_label}"
+                )
+                self.set_stage("metrics", "완료", f"{channel} 연결 · 추적 {tracked}개 · 이번 성과 수집 {synced}건")
+            else:
+                self.youtube_connection_var.set("YouTube: 연결되지 않았습니다.")
+                self.set_stage("metrics", "실패", str(result.get("status") or "연결 실패"))
+
+        self.run_worker(
+            [str(self.python_exe), "shorts_orchestrator.py", "--config", str(ORCHESTRATOR_CONFIG_PATH), "youtube-status", "--sync-metrics"],
+            "유튜브 채널과 이전 업로드 성과 확인 중",
+            on_done=done,
+        )
 
     def apply_daily_summary_feedback(self, lines: list[str]) -> None:
         summary_path: Path | None = None
@@ -2381,6 +2454,16 @@ class ShortsDashboardApp:
             self.status_var.set("제작 없음")
             self.run_note_var.set("자동 실행은 끝났지만 렌더된 쇼츠가 없어 검토 대기가 비어 있습니다.")
             self.set_stage("render", "보류", "렌더된 MP4가 없습니다.")
+
+    def schedule_review_refresh(self) -> None:
+        """Refresh only after the current subprocess worker has fully exited."""
+        def refresh_when_idle() -> None:
+            if self.worker_thread and self.worker_thread.is_alive():
+                self.root.after(120, refresh_when_idle)
+                return
+            self.refresh_reviews()
+
+        self.root.after(120, refresh_when_idle)
 
     def refresh_reviews(self) -> None:
         def done(lines: list[str]) -> None:
@@ -2478,14 +2561,43 @@ class ShortsDashboardApp:
                 note or status,
             ],
             "검토 결과 저장 중",
-            on_done=lambda _lines: self.refresh_reviews(),
+            on_done=lambda _lines: self.schedule_review_refresh(),
         )
+
+    def on_upload_approved_done(self, lines: list[str]) -> None:
+        try:
+            result = json.loads("\n".join(lines) or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        uploads = result.get("uploads", []) if isinstance(result.get("uploads"), list) else []
+        uploaded = sum(1 for item in uploads if isinstance(item, dict) and item.get("status") == "uploaded")
+        if uploaded:
+            schedule = result.get("schedule", {}) if isinstance(result.get("schedule"), dict) else {}
+            first_publish_at = str(schedule.get("first_publish_at") or "")
+            schedule_note = ""
+            if first_publish_at:
+                try:
+                    first_publish = datetime.fromisoformat(first_publish_at.replace("Z", "+00:00"))
+                    now = datetime.now(timezone.utc)
+                    if first_publish <= now:
+                        schedule_note = "첫 영상 즉시 공개"
+                    else:
+                        kst = first_publish.astimezone(timezone(timedelta(hours=9)))
+                        schedule_note = f"첫 공개 {kst:%m/%d %H:%M} KST"
+                except ValueError:
+                    pass
+            self.status_var.set("업로드 완료")
+            self.run_note_var.set(
+                f"승인본 {uploaded}개를 업로드했습니다. {schedule_note}".strip()
+            )
+            self.set_stage("render", "완료", f"승인본 {uploaded}개 업로드 완료 · {schedule_note}".strip())
+        self.schedule_review_refresh()
 
     def upload_approved(self) -> None:
         self.run_worker(
             [str(self.python_exe), "shorts_orchestrator.py", "--config", str(ORCHESTRATOR_CONFIG_PATH), "upload-approved", "--execute"],
             "승인본 업로드 중",
-            on_done=lambda _lines: self.refresh_reviews(),
+            on_done=self.on_upload_approved_done,
         )
 
     def update_stage_from_log(self, line: str) -> None:

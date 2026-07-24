@@ -4,7 +4,7 @@ import argparse
 import hashlib
 import json
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 import re
 import sqlite3
@@ -21,11 +21,14 @@ AUTOMATION_DIR = BASE_DIR / "analysis" / "automation"
 DEFAULT_DB_PATH = AUTOMATION_DIR / "orchestrator.sqlite3"
 DEFAULT_CONFIG_PATH = BASE_DIR / "automation_config.json"
 DEFAULT_BENCHMARK_PROFILE = "templates/benchmark_profiles/rescene_gyaru_variety.json"
-CHECKPOINT_HOURS = (1, 24, 72, 168)
+# Shorts usually reveal their initial response quickly.  Keep the feedback
+# loop inside the first day instead of waiting several days for every test.
+CHECKPOINT_HOURS = (1, 3, 6, 12, 24)
 ANALYTICS_SCOPES = [
     "https://www.googleapis.com/auth/yt-analytics.readonly",
     "https://www.googleapis.com/auth/youtube.readonly",
     "https://www.googleapis.com/auth/youtube.upload",
+    "https://www.googleapis.com/auth/youtube.force-ssl",
 ]
 
 DEFAULT_CONFIG: dict[str, Any] = {
@@ -59,9 +62,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "production": {
         "enabled": True,
-        "max_packages_per_source": "auto",
+        "minimum_packages_per_source": "auto",
         "minimum_score": 85,
+        "minimum_duration_sec_exclusive": 20.0,
         "allowed_decisions": ["auto_render"],
+    },
+    "source_safety": {
+        "enabled": True,
+        "require_verified_owned_source": False,
+        "blocked_terms": ["\ub7f0\ub2dd\ub9e8", "running man"],
+        "blocked_channels": ["\ub7f0\ub2dd\ub9e8 - \uc2a4\ube0c\uc2a4 \uacf5\uc2dd \ucc44\ub110"],
     },
     "review": {
         "enabled": True,
@@ -80,6 +90,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": False,
         "require_review_approval": True,
         "privacy_status": "private",
+        "publish_schedule": {
+            "enabled": False,
+            "mode": "interval",
+            "interval_hours": 4,
+            "daily_slots": ["09:00", "12:00", "15:00", "18:00", "21:00"],
+        },
         "category_id": "24",
         "made_for_kids": False,
     },
@@ -391,7 +407,7 @@ def read_source_duration_sec(source: dict[str, Any]) -> float:
     return 0.0
 
 
-def max_render_count_for_duration(duration_sec: float) -> int:
+def minimum_render_count_for_duration(duration_sec: float) -> int:
     minutes = duration_sec / 60.0 if duration_sec > 0 else 0.0
     if minutes >= 60:
         return 5
@@ -404,14 +420,21 @@ def max_render_count_for_duration(duration_sec: float) -> int:
     return 1
 
 
-def production_render_limit(production: dict[str, Any], source: dict[str, Any]) -> int:
-    configured = production.get("max_packages_per_source", "auto")
+def production_minimum_render_count(production: dict[str, Any], source: dict[str, Any]) -> int:
+    """Return the minimum number of approved shorts to produce for one source.
+
+    ``max_packages_per_source`` is retained as a fallback for older local
+    configuration files, but new configurations use the minimum-oriented key.
+    """
+    configured = production.get("minimum_packages_per_source")
+    if configured is None:
+        configured = production.get("max_packages_per_source", "auto")
     if isinstance(configured, str) and configured.strip().lower() == "auto":
-        return max_render_count_for_duration(read_source_duration_sec(source))
+        return minimum_render_count_for_duration(read_source_duration_sec(source))
     try:
         return max(1, int(configured or 1))
     except (TypeError, ValueError):
-        return max_render_count_for_duration(read_source_duration_sec(source))
+        return minimum_render_count_for_duration(read_source_duration_sec(source))
 
 
 def normalized_tokens(value: str) -> set[str]:
@@ -520,12 +543,34 @@ def run_trend_research(
     if not trend.get("enabled", True):
         return {"status": "disabled", "path": "", "tokens": []}
 
-    latest_path = BASE_DIR / "analysis" / "trends" / "latest_trend_candidates.json"
+    trends_dir = BASE_DIR / "analysis" / "trends"
+    latest_path = trends_dir / "latest_trend_candidates.json"
+    live_path = trends_dir / "live_hot_candidates.json"
+    max_live_age_minutes = max(10, int(trend.get("live_snapshot_max_age_minutes", 25) or 25))
+
+    def live_snapshot() -> dict[str, Any]:
+        snapshot = read_json(live_path, {}) if live_path.exists() else {}
+        created_at = parse_time(str(snapshot.get("created_at") or "")) if isinstance(snapshot, dict) else None
+        if not created_at or utc_now() - created_at > timedelta(minutes=max_live_age_minutes):
+            return {}
+        return snapshot
+
     if dry_run:
-        snapshot = read_json(latest_path, {}) if latest_path.exists() else {}
+        snapshot = live_snapshot() or (read_json(latest_path, {}) if latest_path.exists() else {})
         return {
-            "status": "dry_run_cached" if snapshot else "dry_run_unavailable",
-            "path": str(latest_path) if snapshot else "",
+            "status": "dry_run_live" if snapshot and snapshot.get("created_at") else ("dry_run_cached" if snapshot else "dry_run_unavailable"),
+            "path": str(live_path if snapshot and snapshot.get("created_at") else latest_path) if snapshot else "",
+            "snapshot": snapshot,
+            "tokens": sorted(normalized_tokens(trend_text_from_snapshot(snapshot)))[:300],
+        }
+
+    snapshot = live_snapshot()
+    if snapshot.get("candidates"):
+        output_path = run_dir / "trend_snapshot.json"
+        write_json(output_path, snapshot)
+        return {
+            "status": "live_monitor",
+            "path": str(output_path),
             "snapshot": snapshot,
             "tokens": sorted(normalized_tokens(trend_text_from_snapshot(snapshot)))[:300],
         }
@@ -573,18 +618,28 @@ def trend_candidate_attempts(trend_result: dict[str, Any]) -> list[dict[str, Any
     snapshot = trend_result.get("snapshot", {}) if isinstance(trend_result.get("snapshot"), dict) else {}
     attempts: list[dict[str, Any]] = []
     seen_video_ids: set[str] = set()
+    # The monitor may still display an already used source, but production
+    # must advance to a fresh long-form candidate for the next source cycle.
+    history = read_json(BASE_DIR / "analysis" / "trends" / "trend_history.json", {})
+    processed_sources = history.get("processed_sources", {}) if isinstance(history, dict) else {}
+    processed_video_ids = set(processed_sources) if isinstance(processed_sources, dict) else set()
 
     def add_candidate(item) -> None:
         if not isinstance(item, dict) or not item.get("source_url"):
             return
         video_id = str(item.get("video_id") or item.get("source_url") or "").strip()
-        if not video_id or video_id in seen_video_ids:
+        if not video_id or video_id in seen_video_ids or video_id in processed_video_ids:
             return
         seen_video_ids.add(video_id)
         attempts.append(item)
 
+    # The public trend list can contain finished Shorts. Keep them visible to
+    # the user, but prefer the separately ranked long-form source list here.
+    for item in snapshot.get("production_candidates", []) or []:
+        add_candidate(item)
     selected = snapshot.get("selected") if isinstance(snapshot.get("selected"), dict) else None
-    add_candidate(selected)
+    if not attempts:
+        add_candidate(selected)
     for item in snapshot.get("candidates", []) or []:
         if isinstance(item, dict) and item.get("status") == "green":
             add_candidate(item)
@@ -599,9 +654,40 @@ def trend_source_summary(source: dict[str, Any]) -> dict[str, Any]:
         "analysis_dir": str(source["analysis_dir"]),
         "source_video": str(source["source_video"] or ""),
         "source_title": source["source_title"],
+        "source_channel": str(source.get("source_channel") or ""),
         "source_url": str(source.get("source_url") or ""),
         "ready": bool(source.get("ready")),
     }
+
+
+def source_safety_reason(config: dict[str, Any], source: dict[str, Any]) -> str:
+    """Return a human-readable blocking reason for prohibited source material."""
+    safety = config.get("source_safety", {}) if isinstance(config.get("source_safety"), dict) else {}
+    if not bool(safety.get("enabled", True)):
+        return ""
+
+    metadata: dict[str, Any] = {}
+    analysis_dir = source.get("analysis_dir")
+    if analysis_dir:
+        context = read_json(Path(analysis_dir) / "youtube_context.json", {})
+        if isinstance(context, dict) and isinstance(context.get("metadata"), dict):
+            metadata = context["metadata"]
+    title = first_string(source.get("source_title"), metadata.get("title"))
+    channel = first_string(source.get("source_channel"), metadata.get("channel_title"), metadata.get("uploader"))
+    normalized_title = re.sub(r"\s+", " ", title).strip().casefold()
+    normalized_channel = re.sub(r"\s+", " ", channel).strip().casefold()
+
+    for value in safety.get("blocked_channels", []) or []:
+        blocked = str(value or "").strip().casefold()
+        if blocked and normalized_channel and (blocked in normalized_channel or normalized_channel in blocked):
+            return f"blocked channel: {channel}"
+    for value in safety.get("blocked_terms", []) or []:
+        blocked = str(value or "").strip().casefold()
+        if blocked and (blocked in normalized_title or blocked in normalized_channel):
+            return f"blocked source term: {value}"
+    if bool(safety.get("require_verified_owned_source", False)) and not bool(source.get("owned", False)):
+        return "source rights are not verified; use a rights-cleared owned library source"
+    return ""
 
 
 def acquired_source_from_context(
@@ -622,15 +708,22 @@ def acquired_source_from_context(
         candidate.get("video_id"),
         analysis_dir.name,
     )
+    channel = first_string(
+        candidate.get("channel_title"),
+        candidate.get("channel"),
+        metadata.get("channel_title") if isinstance(metadata, dict) else "",
+        metadata.get("uploader") if isinstance(metadata, dict) else "",
+    )
     return {
         "source_key": source_key_for(analysis_dir),
         "analysis_dir": analysis_dir,
         "source_video": downloaded_video if downloaded_video and downloaded_video.exists() else None,
         "source_title": title,
+        "source_channel": channel,
         "source_url": str(candidate.get("source_url") or context.get("source_url") or ""),
         "duration_sec": duration_sec,
         "source_origin": "trend_acquisition",
-        "owned": True,
+        "owned": False,
         "active": True,
         "priority": 100,
         "ready": (analysis_dir / "merged" / "merged_transcript.json").exists(),
@@ -652,6 +745,7 @@ def acquire_selected_trend_source(
     if not candidates:
         return {"status": "no_selected_trend_source"}
     max_attempts = max(1, int(acquisition.get("max_attempts", 5) or 5))
+    minimum_source_duration = max(1, int(acquisition.get("minimum_source_duration_sec", 480) or 480))
     attempts: list[dict[str, Any]] = []
 
     for candidate in candidates[:max_attempts]:
@@ -661,11 +755,39 @@ def acquire_selected_trend_source(
             attempts.append({"status": "invalid", "candidate": candidate})
             continue
 
+        try:
+            candidate_duration = float(candidate.get("duration_sec") or 0)
+        except (TypeError, ValueError):
+            candidate_duration = 0.0
+        if candidate_duration and candidate_duration < minimum_source_duration:
+            attempts.append(
+                {
+                    "status": "skipped_short_source",
+                    "candidate": candidate,
+                    "reason": f"source is {candidate_duration:.0f}s; requires at least {minimum_source_duration}s",
+                }
+            )
+            continue
+
+        candidate_block_reason = source_safety_reason(
+            config,
+            {
+                "source_title": candidate.get("title"),
+                "source_channel": candidate.get("channel_title") or candidate.get("channel"),
+            },
+        )
+        if candidate_block_reason:
+            attempts.append({"status": "blocked", "candidate": candidate, "reason": candidate_block_reason})
+            continue
+
         analysis_dir = BASE_DIR / "analysis" / f"youtube_{video_id}"
         context_path = analysis_dir / "youtube_context.json"
         if not execute:
             context = read_json(context_path, {}) if context_path.exists() else {}
             source = acquired_source_from_context(candidate=candidate, analysis_dir=analysis_dir, context=context if isinstance(context, dict) else {})
+            block_reason = source_safety_reason(config, source)
+            if block_reason:
+                return {"status": "blocked", "reason": block_reason, "summary": trend_source_summary(source)}
             return {"status": "planned", "source": source, "summary": trend_source_summary(source)}
 
         command = [
@@ -711,6 +833,11 @@ def acquire_selected_trend_source(
         source = acquired_source_from_context(candidate=candidate, analysis_dir=analysis_dir, context=context)
         attempt["summary"] = trend_source_summary(source)
         attempts.append(attempt)
+        block_reason = source_safety_reason(config, source)
+        if block_reason:
+            attempt["status"] = "blocked"
+            attempt["reason"] = block_reason
+            continue
         if source.get("ready") or source.get("source_video"):
             return {
                 "status": "completed",
@@ -810,12 +937,14 @@ def next_checkpoint(published_at: datetime, now: datetime) -> tuple[str, datetim
 
 def checkpoint_for_observation(published_at: datetime, observed_at: datetime) -> str:
     elapsed_hours = max(0.0, (observed_at - published_at).total_seconds() / 3600.0)
-    if elapsed_hours >= 168:
-        return "7d"
-    if elapsed_hours >= 72:
-        return "72h"
     if elapsed_hours >= 24:
         return "24h"
+    if elapsed_hours >= 12:
+        return "12h"
+    if elapsed_hours >= 6:
+        return "6h"
+    if elapsed_hours >= 3:
+        return "3h"
     return "1h"
 
 
@@ -898,6 +1027,25 @@ def record_metrics_snapshot(
     return {"checkpoint": checkpoint, "status": status, "next_check_at": iso_time(next_due) if next_due else ""}
 
 
+def reschedule_metric_checks(conn: sqlite3.Connection, *, now: datetime | None = None) -> int:
+    """Apply the current short-form checkpoint policy to existing uploads."""
+    observed = now or utc_now()
+    rows = conn.execute("SELECT youtube_video_id, published_at FROM published_shorts").fetchall()
+    changed = 0
+    for row in rows:
+        published_at = parse_time(str(row["published_at"] or ""))
+        if not published_at:
+            continue
+        _label, next_due, status = next_checkpoint(published_at, observed)
+        conn.execute(
+            "UPDATE published_shorts SET status = ?, next_check_at = ? WHERE youtube_video_id = ?",
+            (status, iso_time(next_due) if next_due else None, row["youtube_video_id"]),
+        )
+        changed += 1
+    conn.commit()
+    return changed
+
+
 def load_youtube_credentials(settings: dict[str, Any], *, interactive: bool):
     try:
         from google.auth.transport.requests import Request as GoogleRequest
@@ -959,6 +1107,7 @@ def analytics_rows_to_metrics(payload: dict[str, Any]) -> dict[str, Any]:
 
 def sync_due_youtube_metrics(conn: sqlite3.Connection, settings: dict[str, Any], *, dry_run: bool) -> dict[str, Any]:
     now = utc_now()
+    rescheduled = 0 if dry_run else reschedule_metric_checks(conn, now=now)
     due_rows = conn.execute(
         """
         SELECT youtube_video_id, published_at
@@ -969,11 +1118,11 @@ def sync_due_youtube_metrics(conn: sqlite3.Connection, settings: dict[str, Any],
         (iso_time(now),),
     ).fetchall()
     if not due_rows:
-        return {"status": "nothing_due", "synced": 0}
+        return {"status": "nothing_due", "synced": 0, "rescheduled": rescheduled}
     if not settings.get("enabled", False):
-        return {"status": "not_configured", "due": len(due_rows), "synced": 0}
+        return {"status": "not_configured", "due": len(due_rows), "synced": 0, "rescheduled": rescheduled}
     if dry_run:
-        return {"status": "dry_run", "due": len(due_rows), "synced": 0}
+        return {"status": "dry_run", "due": len(due_rows), "synced": 0, "rescheduled": rescheduled}
 
     service = build_youtube_analytics_service(
         settings,
@@ -1007,15 +1156,25 @@ def sync_due_youtube_metrics(conn: sqlite3.Connection, settings: dict[str, Any],
             synced += 1
         except Exception as exc:
             errors.append(f"{row['youtube_video_id']}: {exc}")
-    return {"status": "completed" if not errors else "partial", "due": len(due_rows), "synced": synced, "errors": errors}
+    return {
+        "status": "completed" if not errors else "partial",
+        "due": len(due_rows),
+        "synced": synced,
+        "errors": errors,
+        "rescheduled": rescheduled,
+    }
 
 
 def latest_evaluated_metrics(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT youtube_video_id, checkpoint, metrics_json, observed_at
+        SELECT metrics_snapshots.youtube_video_id, metrics_snapshots.checkpoint,
+               metrics_snapshots.metrics_json, metrics_snapshots.observed_at,
+               published_shorts.package_path
         FROM metrics_snapshots
-        WHERE checkpoint IN ('24h', '72h', '7d')
+        JOIN published_shorts
+          ON published_shorts.youtube_video_id = metrics_snapshots.youtube_video_id
+        WHERE metrics_snapshots.checkpoint IN ('1h', '3h', '6h', '12h', '24h')
         ORDER BY observed_at DESC
         """
     ).fetchall()
@@ -1029,7 +1188,16 @@ def latest_evaluated_metrics(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         if not isinstance(metrics, dict):
             continue
         seen.add(video_id)
-        results.append({"youtube_video_id": video_id, "checkpoint": row["checkpoint"], "metrics": metrics})
+        package = read_json(Path(str(row["package_path"] or "")), {})
+        experiment = package.get("experiment", {}) if isinstance(package, dict) else {}
+        results.append(
+            {
+                "youtube_video_id": video_id,
+                "checkpoint": row["checkpoint"],
+                "metrics": metrics,
+                "experiment": experiment if isinstance(experiment, dict) else {},
+            }
+        )
     return results
 
 
@@ -1054,6 +1222,9 @@ def recent_review_feedback(conn: sqlite3.Connection, limit: int = 5) -> list[dic
         FROM review_items
         WHERE review_status IN ('revision_requested', 'rejected')
             AND COALESCE(reviewer_note, '') != ''
+            AND reviewer_note NOT LIKE 'Rejected automatically:%'
+            AND reviewer_note NOT LIKE 'Paused:%'
+            AND reviewer_note NOT LIKE 'Deleted after copyright claim%'
         ORDER BY COALESCE(decided_at, created_at) DESC
         LIMIT ?
         """,
@@ -1071,7 +1242,15 @@ def derive_learning_rule(conn: sqlite3.Connection, config: dict[str, Any], run_i
     previous_kind = last_rule_kind(conn)
     mode = "baseline"
     rule_kind = "baseline_collect_signal"
-    evidence: dict[str, Any] = {"evaluated_video_count": len(evaluated)}
+    usable_evaluated = [
+        item
+        for item in evaluated
+        if isinstance(item.get("metrics"), dict) and float(item["metrics"].get("views") or 0) > 0
+    ]
+    evidence: dict[str, Any] = {
+        "evaluated_video_count": len(usable_evaluated),
+        "ignored_zero_view_rows": len(evaluated) - len(usable_evaluated),
+    }
     if review_feedback:
         evidence["recent_review_feedback"] = review_feedback
     constraints = [
@@ -1081,12 +1260,29 @@ def derive_learning_rule(conn: sqlite3.Connection, config: dict[str, Any], run_i
     change_note = "No comparable published performance set exists yet; record this run as the baseline."
 
     percentages = []
-    for item in evaluated:
+    for item in usable_evaluated:
         try:
             percentages.append(float(item["metrics"].get("averageViewPercentage")))
         except (TypeError, ValueError):
             continue
-    if len(evaluated) >= minimum and percentages:
+    experiment_results = []
+    for item in usable_evaluated[:5]:
+        experiment = item.get("experiment", {}) if isinstance(item.get("experiment"), dict) else {}
+        if not experiment:
+            continue
+        metrics = item.get("metrics", {}) if isinstance(item.get("metrics"), dict) else {}
+        experiment_results.append(
+            {
+                "checkpoint": item.get("checkpoint"),
+                "hypothesis": str(experiment.get("hypothesis") or "")[:180],
+                "primary_variable": str(experiment.get("primary_variable") or ""),
+                "average_view_percentage": metrics.get("averageViewPercentage"),
+                "views": metrics.get("views"),
+            }
+        )
+    if experiment_results:
+        evidence["recent_experiment_results"] = experiment_results
+    if len(usable_evaluated) >= minimum and percentages:
         median_percentage = round(float(statistics.median(percentages)), 3)
         evidence["median_average_view_percentage"] = median_percentage
         mode = "experiment"
@@ -1129,10 +1325,15 @@ def derive_learning_rule(conn: sqlite3.Connection, config: dict[str, Any], run_i
                 "Recent human review notes: " + " | ".join(feedback_lines[:3]),
             ]
         )
-        if len(evaluated) < minimum:
+        if len(usable_evaluated) < minimum:
             mode = "review_feedback"
             rule_kind = "human_review_revision"
         change_note = "Human review feedback is available; this run must correct the prior content-selection weakness before testing performance."
+
+    if experiment_results:
+        constraints.append(
+            "Treat recent experiment results as evidence, not a fixed template: keep the successful mechanism, but test one clearly named editing variable per package."
+        )
 
     created_at = utc_now()
     rule_id = f"{rule_kind}_{created_at.strftime('%Y%m%dT%H%M%SZ')}"
@@ -1315,7 +1516,8 @@ def render_for_source(
         return {"status": "missing_output", "path": str(aggregate_path)}
 
     minimum_score = int(production.get("minimum_score", 85) or 0)
-    maximum = production_render_limit(production, source)
+    minimum_duration = float(production.get("minimum_duration_sec_exclusive", 20.0) or 20.0)
+    required_minimum = production_minimum_render_count(production, source)
     allowed_decisions = {str(value) for value in production.get("allowed_decisions", ["auto_render"]) or []}
     selected: list[dict[str, Any]] = []
     for package in sorted(
@@ -1334,11 +1536,37 @@ def render_for_source(
         package_path = source["analysis_dir"] / "shorts_candidates" / "final" / f"{short_id}.json"
         if not package_path.exists():
             continue
-        selected.append({"short_id": short_id, "package_path": str(package_path), "score": score, "decision": decision})
-        if len(selected) >= maximum:
+        package_detail = read_json(package_path, {})
+        try:
+            planned_duration = float(package_detail.get("target_duration_sec") or package.get("target_duration_sec") or 0.0)
+        except (TypeError, ValueError):
+            planned_duration = 0.0
+        if planned_duration <= 0:
+            planned_duration = sum(
+                max(0.0, float(clip.get("end_sec", 0.0)) - float(clip.get("start_sec", 0.0)))
+                for clip in package_detail.get("source_clips", []) or []
+                if isinstance(clip, dict)
+            )
+        if planned_duration <= minimum_duration:
+            continue
+        selected.append(
+            {
+                "short_id": short_id,
+                "package_path": str(package_path),
+                "score": score,
+                "decision": decision,
+                "planned_duration_sec": planned_duration,
+            }
+        )
+        if len(selected) >= required_minimum:
             break
     if not selected:
-        return {"status": "no_auto_render_candidate", "minimum_score": minimum_score}
+        return {
+            "status": "no_auto_render_candidate",
+            "minimum_score": minimum_score,
+            "minimum_duration_sec_exclusive": minimum_duration,
+            "required_minimum": required_minimum,
+        }
 
     rendered: list[dict[str, Any]] = []
     for candidate in selected:
@@ -1364,9 +1592,13 @@ def render_for_source(
         if completed.returncode != 0:
             entry["error"] = completed.stderr.strip() or completed.stdout.strip()
         rendered.append(entry)
+    completed_count = sum(1 for item in rendered if item["status"] == "completed")
     return {
-        "status": "completed" if all(item["status"] == "completed" for item in rendered) else "partial",
+        "status": "completed" if completed_count == len(rendered) else "partial",
         "rendered": rendered,
+        "required_minimum": required_minimum,
+        "minimum_met": completed_count >= required_minimum,
+        "minimum_shortfall": max(0, required_minimum - completed_count),
     }
 
 
@@ -1405,7 +1637,41 @@ def probe_video_output(output_path: Path) -> dict[str, Any]:
             timeout=20,
         )
     except FileNotFoundError:
-        return {"status": "unavailable", "reason": "ffprobe not found"}
+        # Windows installs used for rendering often ship ffmpeg through
+        # imageio-ffmpeg but not a separate ffprobe executable.  Still enforce
+        # the duration gate from the rendered media rather than silently
+        # downgrading it to a warning.
+        try:
+            import imageio_ffmpeg  # type: ignore
+
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            fallback = subprocess.run(
+                [ffmpeg_path, "-hide_banner", "-i", str(output_path), "-f", "null", "-"],
+                cwd=BASE_DIR,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=20,
+            )
+        except (ImportError, FileNotFoundError):
+            return {"status": "unavailable", "reason": "ffprobe and ffmpeg are unavailable"}
+        except subprocess.TimeoutExpired:
+            return {"status": "failed", "reason": "ffmpeg timed out"}
+        text = "\n".join((fallback.stdout, fallback.stderr))
+        duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text)
+        size_match = re.search(r"(\d{2,5})x(\d{2,5})", text)
+        if not duration_match:
+            return {"status": "failed", "reason": "ffmpeg could not read the rendered media"}
+        hours, minutes, seconds = duration_match.groups()
+        duration = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        return {
+            "status": "completed",
+            "width": int(size_match.group(1)) if size_match else 0,
+            "height": int(size_match.group(2)) if size_match else 0,
+            "duration": duration,
+            "probe_backend": "ffmpeg",
+        }
     except subprocess.TimeoutExpired:
         return {"status": "failed", "reason": "ffprobe timed out"}
     if completed.returncode != 0:
@@ -1428,7 +1694,7 @@ def probe_video_output(output_path: Path) -> dict[str, Any]:
     }
 
 
-def auto_review_render(output_path: Path) -> dict[str, Any]:
+def auto_review_render(output_path: Path, *, minimum_duration_exclusive: float = 20.0) -> dict[str, Any]:
     checks: dict[str, Any] = {"output_path": str(output_path)}
     issues: list[str] = []
     warnings: list[str] = []
@@ -1446,8 +1712,11 @@ def auto_review_render(output_path: Path) -> dict[str, Any]:
     if probe.get("status") == "completed":
         if probe.get("width") != 1080 or probe.get("height") != 1920:
             issues.append(f"expected 1080x1920 video, got {probe.get('width')}x{probe.get('height')}")
-        if float(probe.get("duration") or 0.0) <= 0.5:
+        duration = float(probe.get("duration") or 0.0)
+        if duration <= 0.5:
             issues.append("rendered duration is too short")
+        elif duration <= minimum_duration_exclusive:
+            issues.append(f"rendered duration must be longer than {minimum_duration_exclusive:g} seconds")
     elif probe.get("status") == "unavailable":
         warnings.append(str(probe.get("reason") or "ffprobe unavailable"))
     else:
@@ -1463,6 +1732,7 @@ def register_review_items(
     source: dict[str, Any],
     run_id: str,
     render: dict[str, Any],
+    minimum_duration_exclusive: float = 20.0,
 ) -> dict[str, Any]:
     rendered = [item for item in render.get("rendered", []) or [] if isinstance(item, dict)]
     entries: list[dict[str, Any]] = []
@@ -1471,7 +1741,7 @@ def register_review_items(
             continue
         output_path = Path(str(item["output_path"])).resolve()
         package_path = Path(str(item.get("package_path") or "")).resolve()
-        qa = auto_review_render(output_path)
+        qa = auto_review_render(output_path, minimum_duration_exclusive=minimum_duration_exclusive)
         if output_path.exists():
             content_sha256 = file_sha256(output_path)
         else:
@@ -1554,6 +1824,16 @@ def record_review_decision(conn: sqlite3.Connection, *, output_path: Path, statu
         row = conn.execute("SELECT * FROM review_items WHERE content_sha256 = ?", (file_sha256(output_path),)).fetchone()
     if not row:
         raise RuntimeError(f"No review item found for output: {resolved}")
+    if status == "approved":
+        source_row = conn.execute(
+            "SELECT active FROM library_sources WHERE source_key = ?",
+            (row["source_key"],),
+        ).fetchone()
+        if not source_row or not bool(source_row["active"]):
+            raise RuntimeError("Approval blocked: this source has been disabled by the source-safety check.")
+        qa = auto_review_render(Path(str(row["output_path"])).resolve(), minimum_duration_exclusive=20.0)
+        if qa["qa_status"] == "fail":
+            raise RuntimeError("Approval blocked: the rendered video failed the mandatory safety/length check.")
     conn.execute(
         """
         UPDATE review_items
@@ -1574,18 +1854,182 @@ def youtube_upload_metadata(package_path: Path) -> dict[str, Any]:
     package = read_json(package_path, {})
     if not isinstance(package, dict):
         raise RuntimeError(f"Invalid rendered package JSON: {package_path}")
-    title = " ".join(
-        part.strip()
-        for part in (str(package.get("title_line1") or ""), str(package.get("title_line2") or ""))
-        if part.strip()
-    )[:100]
+
+    analysis_dir = package_path.parent.parent.parent
+    context = read_json(analysis_dir / "youtube_context.json", {})
+    context_metadata = context.get("metadata", {}) if isinstance(context, dict) else {}
+    source_channel = str(context_metadata.get("channel_title") or "").strip()
+    source_url = str(context.get("source_url") or "").strip() if isinstance(context, dict) else ""
+    if not source_channel or not source_url:
+        raise RuntimeError("Upload blocked: source channel and source URL are required for attribution.")
+
+    title = re.sub(r"(?:^|\s)#[^\s#]+", "", str(package.get("upload_title") or "")).strip()
+    if not title:
+        title = " ".join(
+            part.strip()
+            for part in (str(package.get("title_line1") or ""), str(package.get("title_line2") or ""))
+            if part.strip()
+        )[:100]
     if not title:
         title = package_path.stem[:100]
     pitch = str(package.get("selection_pitch") or "").strip()
     tags = [str(tag).strip().lstrip("#") for tag in package.get("fun_tags", []) or [] if str(tag).strip()]
-    hashtag_line = " ".join(f"#{tag.replace(' ', '')}" for tag in tags[:8])
-    description = "\n\n".join(part for part in (pitch, hashtag_line, "#shorts") if part)[:5000]
+    if source_channel and source_channel.casefold() not in {tag.casefold() for tag in tags}:
+        tags.append(source_channel)
+    emoji_by_tag = {
+        "웃김": "😂",
+        "반전": "🤯",
+        "긴장": "😮",
+        "감동": "🥹",
+        "관계": "🤝",
+        "캐릭터": "✨",
+    }
+    lead_emoji = next((emoji_by_tag[tag] for tag in tags if tag in emoji_by_tag), "🎬")
+    title = f"{lead_emoji} {title}"[:100]
+    if pitch:
+        pitch = f"{lead_emoji} {pitch}"
+    hashtag_line = " ".join(f"#{re.sub(r'[^0-9A-Za-z가-힣_]', '', tag)}" for tag in tags[:8])
+    attribution = f"📺 원본 전체 영상은 {source_channel}에서 확인하세요.\n🔗 원본 링크: {source_url}"
+    description = "\n\n".join(part for part in (pitch, attribution, hashtag_line, "#shorts") if part)[:5000]
     return {"title": title, "description": description, "tags": tags[:20]}
+
+
+def latest_channel_publish_anchor(service: Any, conn: sqlite3.Connection) -> datetime | None:
+    """Find the latest actual or scheduled publication across the connected channel."""
+    anchors: list[datetime] = []
+    for row in conn.execute("SELECT published_at FROM published_shorts WHERE published_at != ''").fetchall():
+        recorded = parse_time(str(row["published_at"] or ""))
+        if recorded:
+            anchors.append(recorded)
+
+    channels = service.channels().list(part="contentDetails", mine=True).execute().get("items", [])
+    if not channels:
+        return max(anchors) if anchors else None
+    uploads_playlist = str(
+        channels[0].get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads") or ""
+    )
+    if not uploads_playlist:
+        return max(anchors) if anchors else None
+    playlist_items = service.playlistItems().list(
+        part="contentDetails",
+        playlistId=uploads_playlist,
+        maxResults=50,
+    ).execute().get("items", [])
+    video_ids = [
+        str(item.get("contentDetails", {}).get("videoId") or "")
+        for item in playlist_items
+        if item.get("contentDetails", {}).get("videoId")
+    ]
+    for start in range(0, len(video_ids), 50):
+        videos = service.videos().list(
+            part="snippet,status",
+            id=",".join(video_ids[start : start + 50]),
+        ).execute().get("items", [])
+        for video in videos:
+            status = video.get("status", {}) if isinstance(video.get("status"), dict) else {}
+            snippet = video.get("snippet", {}) if isinstance(video.get("snippet"), dict) else {}
+            scheduled = parse_time(str(status.get("publishAt") or ""))
+            if scheduled:
+                anchors.append(scheduled)
+                continue
+            if str(status.get("privacyStatus") or "").lower() in {"public", "unlisted"}:
+                published = parse_time(str(snippet.get("publishedAt") or ""))
+                if published:
+                    anchors.append(published)
+    return max(anchors) if anchors else None
+
+
+KST = timezone(timedelta(hours=9), name="KST")
+
+
+def parse_daily_publish_slots(schedule: dict[str, Any]) -> list[tuple[int, int]]:
+    """Parse unique local-time publishing slots such as ``09:00``."""
+    raw_slots = schedule.get("daily_slots", [])
+    if not isinstance(raw_slots, list):
+        raise RuntimeError("publish_schedule.daily_slots must be a list such as ['09:00', '12:00'].")
+    slots: set[tuple[int, int]] = set()
+    for raw_slot in raw_slots:
+        match = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", str(raw_slot))
+        if not match:
+            raise RuntimeError(f"Invalid daily publish slot: {raw_slot!r}. Use HH:MM.")
+        hour, minute = int(match.group(1)), int(match.group(2))
+        if hour > 23 or minute > 59:
+            raise RuntimeError(f"Invalid daily publish slot: {raw_slot!r}. Use a valid 24-hour time.")
+        slots.add((hour, minute))
+    if not slots:
+        raise RuntimeError("At least one publish_schedule.daily_slots value is required for daily_slots mode.")
+    return sorted(slots)
+
+
+def fixed_daily_publish_schedule(
+    *,
+    anchor: datetime | None,
+    now: datetime,
+    count: int,
+    slots: list[tuple[int, int]],
+) -> list[datetime]:
+    """Return the next local KST slots strictly after the latest channel event."""
+    cutoff = max(now, anchor) if anchor else now
+    cutoff = cutoff.astimezone(KST)
+    day = cutoff.date()
+    publish_times: list[datetime] = []
+    while len(publish_times) < count:
+        selected = False
+        for hour, minute in slots:
+            slot = datetime.combine(day, time(hour, minute), tzinfo=KST)
+            if slot <= cutoff:
+                continue
+            publish_times.append(slot.astimezone(timezone.utc))
+            cutoff = slot
+            selected = True
+            break
+        if not selected:
+            day += timedelta(days=1)
+            cutoff = datetime.combine(day, time.min, tzinfo=KST)
+    return publish_times
+
+
+def approved_upload_schedule(
+    conn: sqlite3.Connection,
+    upload: dict[str, Any],
+    count: int,
+    service: Any,
+) -> tuple[list[datetime | None], dict[str, str]]:
+    """Schedule approved uploads after the latest channel publish or reservation."""
+    schedule = upload.get("publish_schedule", {}) if isinstance(upload.get("publish_schedule"), dict) else {}
+    if not bool(schedule.get("enabled", False)):
+        return [None] * count, {"anchor_at": "", "first_publish_at": ""}
+    if str(upload.get("privacy_status") or "private").lower() != "public":
+        raise RuntimeError("Scheduled publishing requires youtube_upload.privacy_status to be 'public'.")
+    now = utc_now()
+    anchor = latest_channel_publish_anchor(service, conn)
+    mode = str(schedule.get("mode") or "interval").strip().lower()
+    if mode == "daily_slots":
+        slots = parse_daily_publish_slots(schedule)
+        publish_times = fixed_daily_publish_schedule(
+            anchor=anchor,
+            now=now,
+            count=count,
+            slots=slots,
+        )
+        return publish_times, {
+            "anchor_at": iso_time(anchor) if anchor else "",
+            "first_publish_at": iso_time(publish_times[0]) if publish_times else "",
+            "mode": "daily_slots",
+            "daily_slots": ", ".join(f"{hour:02d}:{minute:02d}" for hour, minute in slots),
+        }
+
+    if mode != "interval":
+        raise RuntimeError("publish_schedule.mode must be 'interval' or 'daily_slots'.")
+    interval_hours = max(1, int(schedule.get("interval_hours", 4) or 4))
+    next_allowed = anchor + timedelta(hours=interval_hours) if anchor else now
+    first_publish = max(now, next_allowed)
+    publish_times = [first_publish + timedelta(hours=interval_hours * index) for index in range(count)]
+    return [None if index == 0 and first_publish <= now else value for index, value in enumerate(publish_times)], {
+        "anchor_at": iso_time(anchor) if anchor else "",
+        "first_publish_at": iso_time(first_publish),
+        "mode": "interval",
+    }
 
 
 def upload_rendered_outputs(
@@ -1594,6 +2038,7 @@ def upload_rendered_outputs(
     render: dict[str, Any],
     *,
     execute: bool,
+    youtube_service: Any | None = None,
 ) -> dict[str, Any]:
     upload = config.get("youtube_upload", {}) if isinstance(config.get("youtube_upload"), dict) else {}
     if not bool(upload.get("enabled", False)):
@@ -1612,7 +2057,7 @@ def upload_rendered_outputs(
     except ImportError as exc:
         raise RuntimeError("Install Google API dependencies from requirements.txt before enabling YouTube upload.") from exc
     analytics = config.get("youtube_analytics", {}) if isinstance(config.get("youtube_analytics"), dict) else {}
-    service = build_youtube_upload_service(
+    service = youtube_service or build_youtube_upload_service(
         analytics,
         interactive=bool(analytics.get("interactive_on_first_run", False)),
     )
@@ -1653,6 +2098,8 @@ def upload_rendered_outputs(
             )
             continue
         metadata = youtube_upload_metadata(package_path)
+        scheduled_publish_at = parse_time(str(item.get("scheduled_publish_at") or ""))
+        effective_privacy_status = "private" if scheduled_publish_at else privacy_status
         body = {
             "snippet": {
                 "title": metadata["title"],
@@ -1661,10 +2108,12 @@ def upload_rendered_outputs(
                 "categoryId": str(upload.get("category_id") or "24"),
             },
             "status": {
-                "privacyStatus": privacy_status,
+                "privacyStatus": effective_privacy_status,
                 "selfDeclaredMadeForKids": bool(upload.get("made_for_kids", False)),
             },
         }
+        if scheduled_publish_at:
+            body["status"]["publishAt"] = iso_time(scheduled_publish_at)
         try:
             response = (
                 service.videos()
@@ -1688,14 +2137,23 @@ def upload_rendered_outputs(
                     str(output_path),
                     str(package_path),
                     video_id,
-                    privacy_status,
+                    effective_privacy_status,
                     iso_time(),
                     json.dumps(response, ensure_ascii=False),
                 ),
             )
             conn.commit()
-            result = {"status": "uploaded", "output_path": str(output_path), "youtube_video_id": video_id, "privacy_status": privacy_status}
-            if privacy_status == "public":
+            result = {"status": "uploaded", "output_path": str(output_path), "youtube_video_id": video_id, "privacy_status": effective_privacy_status}
+            if scheduled_publish_at:
+                register_published_short(
+                    conn,
+                    youtube_video_id=video_id,
+                    package_path=package_path,
+                    published_at=scheduled_publish_at,
+                )
+                result["scheduled_publish_at"] = iso_time(scheduled_publish_at)
+                result["metrics_registered"] = True
+            elif privacy_status == "public":
                 register_published_short(
                     conn,
                     youtube_video_id=video_id,
@@ -1703,6 +2161,11 @@ def upload_rendered_outputs(
                     published_at=utc_now(),
                 )
                 result["metrics_registered"] = True
+            conn.execute(
+                "UPDATE review_items SET review_status = 'uploaded' WHERE content_sha256 = ?",
+                (content_sha256,),
+            )
+            conn.commit()
             results.append(result)
         except Exception as exc:
             results.append({"status": "failed", "output_path": str(output_path), "error": str(exc)})
@@ -1718,33 +2181,163 @@ def upload_approved_reviews(
     *,
     execute: bool,
     limit: int,
+    output_path: Path | None = None,
 ) -> dict[str, Any]:
+    filters = [
+        "review_items.review_status = 'approved'",
+        "rendered_uploads.content_sha256 IS NULL",
+    ]
+    parameters: list[Any] = []
+    if output_path is not None:
+        filters.append("review_items.output_path = ?")
+        parameters.append(str(output_path.resolve()))
+    parameters.append(max(1, limit))
     rows = conn.execute(
-        """
+        f"""
         SELECT review_items.*
         FROM review_items
         LEFT JOIN rendered_uploads
             ON rendered_uploads.content_sha256 = review_items.content_sha256
-        WHERE review_items.review_status = 'approved'
-            AND rendered_uploads.content_sha256 IS NULL
+        JOIN library_sources
+            ON library_sources.source_key = review_items.source_key
+        WHERE {' AND '.join(filters)}
+            AND library_sources.active = 1
         ORDER BY COALESCE(review_items.decided_at, review_items.created_at) DESC
         LIMIT ?
         """,
-        (max(1, limit),),
+        parameters,
     ).fetchall()
     if not rows:
         return {"status": "nothing_to_upload"}
+    eligible_rows = []
+    blocked_outputs: list[str] = []
+    for row in rows:
+        qa = auto_review_render(Path(str(row["output_path"])).resolve(), minimum_duration_exclusive=20.0)
+        if qa["qa_status"] == "fail":
+            blocked_outputs.append(str(row["output_path"]))
+            conn.execute(
+                "UPDATE review_items SET review_status = 'qa_failed', reviewer_note = ? WHERE content_sha256 = ?",
+                ("Upload blocked by mandatory source-safety/length check.", row["content_sha256"]),
+            )
+            continue
+        eligible_rows.append(row)
+    conn.commit()
+    if not eligible_rows:
+        return {"status": "blocked_by_safety", "blocked_outputs": blocked_outputs}
+    rows = eligible_rows
+    analytics = config.get("youtube_analytics", {}) if isinstance(config.get("youtube_analytics"), dict) else {}
+    service = build_youtube_upload_service(
+        analytics,
+        interactive=bool(analytics.get("interactive_on_first_run", False)),
+    )
+    publish_times, schedule_info = approved_upload_schedule(
+        conn,
+        config.get("youtube_upload", {}) if isinstance(config.get("youtube_upload"), dict) else {},
+        len(rows),
+        service,
+    )
     render = {
         "rendered": [
             {
                 "status": "completed",
                 "output_path": row["output_path"],
                 "package_path": row["package_path"],
+                "scheduled_publish_at": iso_time(publish_times[index]) if publish_times[index] else "",
             }
-            for row in rows
+            for index, row in enumerate(rows)
         ]
     }
-    return upload_rendered_outputs(conn, config, render, execute=execute)
+    result = upload_rendered_outputs(conn, config, render, execute=execute, youtube_service=service)
+    result["schedule"] = schedule_info
+    return result
+
+
+def youtube_connection_status(conn: sqlite3.Connection, config: dict[str, Any], *, sync_metrics: bool) -> dict[str, Any]:
+    analytics = config.get("youtube_analytics", {}) if isinstance(config.get("youtube_analytics"), dict) else {}
+    if not bool(analytics.get("enabled", False)):
+        return {"status": "disabled"}
+    service = build_youtube_upload_service(analytics, interactive=False)
+    channels = service.channels().list(part="snippet", mine=True).execute().get("items", [])
+    if not channels:
+        return {"status": "no_channel"}
+    channel = channels[0]
+    result = {
+        "status": "connected",
+        "channel_title": str(channel.get("snippet", {}).get("title") or ""),
+        "channel_id": str(channel.get("id") or ""),
+    }
+    tracking = conn.execute(
+        """
+        SELECT COUNT(*) AS tracked_count, MIN(next_check_at) AS next_check_at
+        FROM published_shorts
+        WHERE status = 'watching' AND next_check_at IS NOT NULL
+        """
+    ).fetchone()
+    result["metrics_tracking"] = {
+        "tracked_count": int(tracking["tracked_count"] or 0),
+        "next_check_at": str(tracking["next_check_at"] or ""),
+    }
+    if sync_metrics:
+        result["metrics_sync"] = sync_due_youtube_metrics(conn, analytics, dry_run=False)
+    return result
+
+
+def recent_youtube_performance(config: dict[str, Any], *, limit: int) -> dict[str, Any]:
+    """Read the newest public channel videos and their current visible statistics."""
+    analytics = config.get("youtube_analytics", {}) if isinstance(config.get("youtube_analytics"), dict) else {}
+    if not bool(analytics.get("enabled", False)):
+        return {"status": "disabled", "videos": []}
+    service = build_youtube_upload_service(analytics, interactive=False)
+    channels = service.channels().list(part="snippet,contentDetails", mine=True).execute().get("items", [])
+    if not channels:
+        return {"status": "no_channel", "videos": []}
+    channel = channels[0]
+    uploads_playlist = str(channel.get("contentDetails", {}).get("relatedPlaylists", {}).get("uploads") or "")
+    if not uploads_playlist:
+        return {"status": "no_uploads_playlist", "videos": []}
+    playlist_items = service.playlistItems().list(
+        part="contentDetails",
+        playlistId=uploads_playlist,
+        maxResults=50,
+    ).execute().get("items", [])
+    video_ids = [
+        str(item.get("contentDetails", {}).get("videoId") or "")
+        for item in playlist_items
+        if item.get("contentDetails", {}).get("videoId")
+    ]
+    if not video_ids:
+        return {"status": "connected", "channel_title": str(channel.get("snippet", {}).get("title") or ""), "videos": []}
+    videos: list[dict[str, Any]] = []
+    for start in range(0, len(video_ids), 50):
+        payload = service.videos().list(
+            part="snippet,status,statistics",
+            id=",".join(video_ids[start : start + 50]),
+        ).execute().get("items", [])
+        for video in payload:
+            status = video.get("status", {}) if isinstance(video.get("status"), dict) else {}
+            if str(status.get("privacyStatus") or "").lower() != "public":
+                continue
+            snippet = video.get("snippet", {}) if isinstance(video.get("snippet"), dict) else {}
+            statistics = video.get("statistics", {}) if isinstance(video.get("statistics"), dict) else {}
+            published_at = parse_time(str(snippet.get("publishedAt") or ""))
+            if not published_at:
+                continue
+            videos.append(
+                {
+                    "youtube_video_id": str(video.get("id") or ""),
+                    "title": str(snippet.get("title") or ""),
+                    "published_at": iso_time(published_at),
+                    "views": int(statistics.get("viewCount") or 0),
+                    "likes": int(statistics.get("likeCount") or 0),
+                    "comments": int(statistics.get("commentCount") or 0),
+                }
+            )
+    videos.sort(key=lambda item: item["published_at"], reverse=True)
+    return {
+        "status": "connected",
+        "channel_title": str(channel.get("snippet", {}).get("title") or ""),
+        "videos": videos[: max(1, min(limit, 20))],
+    }
 
 
 def run_daily(args: argparse.Namespace) -> dict[str, Any]:
@@ -1805,9 +2398,31 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
         if acquired_source:
             sources.insert(0, acquired_source)
 
+        permitted_sources: list[dict[str, Any]] = []
+        blocked_sources: list[dict[str, str]] = []
+        for source in sources:
+            block_reason = source_safety_reason(config, source)
+            if block_reason:
+                blocked_sources.append(
+                    {
+                        "source_key": str(source.get("source_key") or ""),
+                        "source_title": str(source.get("source_title") or ""),
+                        "reason": block_reason,
+                    }
+                )
+                conn.execute("UPDATE library_sources SET active = 0 WHERE source_key = ?", (source["source_key"],))
+                continue
+            permitted_sources.append(source)
+        conn.commit()
+        sources = permitted_sources
+        summary["source_preflight"] = {
+            "checked": len(permitted_sources) + len(blocked_sources),
+            "blocked": blocked_sources,
+        }
+
         if not sources:
             raise RuntimeError(
-                "No source is available. Enable source_acquisition or add permitted library sources."
+                "No permitted source is available after the source-safety preflight."
             )
         for source in sources:
             upsert_library_source(conn, source)
@@ -1860,6 +2475,12 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
                                 source=source,
                                 run_id=run_id,
                                 render=item["render"],
+                                minimum_duration_exclusive=float(
+                                    (config.get("production", {}) if isinstance(config.get("production"), dict) else {}).get(
+                                        "minimum_duration_sec_exclusive", 20.0
+                                    )
+                                    or 20.0
+                                ),
                             )
                         print(f"[orchestrator] phase=upload source={source['source_title']}", flush=True)
                         item["upload"] = upload_rendered_outputs(
@@ -1881,11 +2502,28 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
                 conn.commit()
             source_results.append(item)
         summary["sources"] = source_results
-        summary["status"] = "completed"
-        conn.execute(
-            "UPDATE runs SET status = ?, learning_rule_id = ? WHERE run_id = ?",
-            ("completed", learning_rule["rule_id"], run_id),
+        generation_failures = [
+            item.get("generation", {}).get("error", "candidate generation failed")
+            for item in source_results
+            if isinstance(item.get("generation"), dict) and item["generation"].get("status") == "failed"
+        ]
+        generated_any = any(
+            isinstance(item.get("generation"), dict) and item["generation"].get("status") == "completed"
+            for item in source_results
         )
+        if source_results and not generated_any and generation_failures:
+            summary["status"] = "no_candidates"
+            summary["candidate_failure"] = generation_failures[0]
+            conn.execute(
+                "UPDATE runs SET status = ?, learning_rule_id = ?, error_text = ? WHERE run_id = ?",
+                ("no_candidates", learning_rule["rule_id"], generation_failures[0], run_id),
+            )
+        else:
+            summary["status"] = "completed"
+            conn.execute(
+                "UPDATE runs SET status = ?, learning_rule_id = ? WHERE run_id = ?",
+                ("completed", learning_rule["rule_id"], run_id),
+            )
         conn.commit()
     except Exception as exc:
         summary["status"] = "failed"
@@ -2030,6 +2668,13 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser = subparsers.add_parser("upload-approved", help="Upload approved review items using the configured YouTube upload settings.")
     upload_parser.add_argument("--execute", action="store_true")
     upload_parser.add_argument("--limit", type=int, default=5)
+    upload_parser.add_argument("--output", type=Path, help="Upload only this approved rendered MP4.")
+
+    youtube_status_parser = subparsers.add_parser("youtube-status", help="Verify the connected YouTube channel and optionally sync due performance checks.")
+    youtube_status_parser.add_argument("--sync-metrics", action="store_true")
+
+    recent_performance_parser = subparsers.add_parser("recent-performance", help="Show current visible statistics for recent public channel videos.")
+    recent_performance_parser.add_argument("--limit", type=int, default=5)
 
     subparsers.add_parser("authorize-youtube", help="Run the one-time local OAuth flow for YouTube Analytics syncing.")
 
@@ -2104,7 +2749,16 @@ def main() -> None:
             config,
             execute=bool(args.execute),
             limit=args.limit,
+            output_path=args.output,
         )
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    elif args.command == "youtube-status":
+        config = load_config(args.config.resolve())
+        result = youtube_connection_status(conn, config, sync_metrics=bool(args.sync_metrics))
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+    elif args.command == "recent-performance":
+        config = load_config(args.config.resolve())
+        result = recent_youtube_performance(config, limit=int(args.limit or 5))
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     elif args.command == "register-published":
         result = register_published_short(

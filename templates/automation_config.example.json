@@ -36,9 +36,16 @@
   },
   "production": {
     "enabled": true,
-    "max_packages_per_source": 1,
+    "minimum_packages_per_source": "auto",
     "minimum_score": 85,
+    "minimum_duration_sec_exclusive": 20.0,
     "allowed_decisions": ["auto_render"]
+  },
+  "source_safety": {
+    "enabled": true,
+    "require_verified_owned_source": false,
+    "blocked_terms": ["런닝맨", "running man"],
+    "blocked_channels": ["런닝맨 - 스브스 공식 채널"]
   },
   "review": {
     "enabled": true
@@ -57,6 +64,12 @@
     "enabled": false,
     "require_review_approval": true,
     "privacy_status": "private",
+    "publish_schedule": {
+      "enabled": false,
+      "mode": "daily_slots",
+      "daily_slots": ["09:00", "12:00", "15:00", "18:00", "21:00"],
+      "interval_hours": 4
+    },
     "category_id": "24",
     "made_for_kids": false
   }

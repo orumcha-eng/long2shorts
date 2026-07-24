@@ -1,58 +1,31 @@
 {
   "window_hours": 72,
+  "recency_weights": {
+    "under_24_hours": 3,
+    "under_48_hours": 2,
+    "under_72_hours": 1
+  },
   "candidate_limit": 20,
+  "monitor_interval_minutes": 10,
   "search_results_per_query": 20,
-  "min_duration_sec": 480,
-  "max_duration_sec": 7200,
+  "video_category_ids": ["24", "23"],
+  "minimum_selection_score": 0,
+  "minimum_production_source_duration_sec": 480,
+  "expand_chart_channels": true,
+  "longform_channel_seed_limit": 30,
+  "min_duration_sec": 0,
+  "max_duration_sec": 999999,
   "region_code": "KR",
   "language": "ko",
-  "queries": [
-    "한국 예능",
-    "연예인 토크쇼",
-    "유재석 예능",
-    "예능 게스트",
-    "아이돌 예능",
-    "핑계고",
-    "놀면 뭐하니",
+  "queries": [],
+  "green_channel_keywords": [],
+  "block_title_keywords": [],
+  "excluded_title_keywords": [
     "런닝맨",
-    "빠더너스",
-    "연예 예능 화제"
+    "running man"
   ],
-  "green_channel_keywords": [
-    "뜬뜬",
-    "놀면 뭐하니",
-    "런닝맨",
-    "SBS",
-    "MBC",
-    "KBS",
-    "JTBC",
-    "tvN",
-    "빠더너스",
-    "스튜디오 와플",
-    "채널십오야",
-    "요정재형",
-    "숙스러운 미숙씨"
+  "excluded_channel_keywords": [
+    "런닝맨 - 스브스 공식 채널"
   ],
-  "block_title_keywords": [
-    "불륜",
-    "사망",
-    "도박",
-    "마약",
-    "폭로",
-    "이혼",
-    "고소",
-    "충격",
-    "해외도피",
-    "전말"
-  ],
-  "skip_title_keywords": [
-    "LIVE",
-    "실시간",
-    "streaming",
-    "스트리밍",
-    "예고",
-    "Preview",
-    "Teaser",
-    "티저"
-  ]
+  "skip_title_keywords": []
 }

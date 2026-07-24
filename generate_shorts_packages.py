@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -41,16 +42,30 @@ BENCHMARK_LOCAL_MAX_COMPLETION_TOKENS = 8_000
 GLOBAL_MAX_COMPLETION_TOKENS = 2_400
 PACKAGING_MAX_COMPLETION_TOKENS = 4_800
 WIDE_WINDOW_GROUP_SIZE = 2
-TARGET_DURATION_MIN = 32.0
-TARGET_DURATION_MAX = 58.0
+TARGET_DURATION_MIN = 25.0
+TARGET_DURATION_MAX = 55.0
 ALLOWED_DURATION_MIN = 22.0
-ALLOWED_DURATION_MAX = 65.0
+ALLOWED_DURATION_MAX = 180.0
+MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC = 20.0
 MIN_CLIP_COUNT = 5
 RECOMMENDED_CLIP_COUNT_MIN = 5
 RECOMMENDED_CLIP_COUNT_MAX = 8
 MAX_CLIP_COUNT = 10
 MIN_CLIP_DURATION_SEC = 0.4
-MAX_FINAL_CLIP_DURATION_SEC = 14.0
+MAX_FINAL_CLIP_DURATION_SEC = 8.0
+MIN_VISIBLE_JUMP_CUTS = 2
+MIN_VISIBLE_JUMP_CUTS_LONG = 3
+MAX_SOUND_EFFECTS = 3
+SOUND_EFFECT_CUES = {
+    "entrance",
+    "transition",
+    "surprise",
+    "impact",
+    "correct",
+    "wrong",
+    "awkward",
+    "applause",
+}
 MAX_LOCAL_CLIP_DURATION_SEC = 20.0
 MONTAGE_ANCHOR_MAX_DURATION_SEC = 8.0
 MONTAGE_CALLBACK_HOOK_MAX_DURATION_SEC = 5.5
@@ -379,6 +394,7 @@ Rules:
 - narration target_start must also be relative to the short timeline
 - use natural Korean suitable for the source type; for YouTube variety/talk, prefer casual entertainment phrasing over movie recap phrasing
 - if names are uncertain, use roles or relationship labels
+- include one explicit experiment record so the next performance review can connect the result to an actual edit decision. It must name one primary variable and 2 to 4 concrete choices drawn from this package's real cuts, captions, framing, or sound effects. Do not claim a visual correction that was not actually planned.
 
 Return JSON only.
 """
@@ -456,6 +472,20 @@ def safe_total_clip_duration_sec(clips) -> float | None:
     return round(total, 3)
 
 
+def visible_jump_cut_count(clips: list[dict]) -> int:
+    """Count source-time skips; adjacent split ranges are not real jump cuts."""
+    jump_cuts = 0
+    for previous, current in zip(clips, clips[1:]):
+        try:
+            previous_end = float(previous.get("source_end"))
+            current_start = float(current.get("source_start"))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if abs(current_start - previous_end) >= 0.5:
+            jump_cuts += 1
+    return jump_cuts
+
+
 def normalize_clip_purpose(value: object) -> str:
     purpose = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
     if purpose in CLIP_PURPOSES:
@@ -488,6 +518,42 @@ def repair_clip_plan_count(clips: list[dict]) -> None:
         return
 
     clips[:] = [clip for clip in clips if isinstance(clip, dict)]
+
+    # A model occasionally returns an otherwise useful edit plan with one broad
+    # transcript range.  Split that range before checking the clip count, but
+    # keep the resulting ranges adjacent: these are not treated as fake jump
+    # cuts by ``visible_jump_cut_count`` below.
+    expanded: list[dict] = []
+    for original in clips:
+        try:
+            start = float(original.get("source_start"))
+            end = float(original.get("source_end"))
+        except (TypeError, ValueError):
+            expanded.append(original)
+            continue
+        duration = end - start
+        pieces = max(1, math.ceil(duration / MAX_FINAL_CLIP_DURATION_SEC))
+        if pieces == 1 or len(expanded) + pieces > MAX_CLIP_COUNT:
+            expanded.append(original)
+            continue
+
+        piece_duration = duration / pieces
+        original_purpose = normalize_clip_purpose(original.get("purpose"))
+        for piece_index in range(pieces):
+            piece = dict(original)
+            piece["source_start"] = round(start + piece_duration * piece_index, 3)
+            piece["source_end"] = round(
+                end if piece_index == pieces - 1 else start + piece_duration * (piece_index + 1),
+                3,
+            )
+            if piece_index == 0:
+                piece["purpose"] = "hook" if original_purpose == "hook" else original_purpose
+            elif piece_index == pieces - 1:
+                piece["purpose"] = original_purpose
+            else:
+                piece["purpose"] = "context" if original_purpose == "hook" else "bridge"
+            expanded.append(piece)
+    clips[:] = expanded
 
     while len(clips) < MIN_CLIP_COUNT:
         split_index = None
@@ -760,6 +826,7 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         "emotion_arc",
         "title_line1",
         "title_line2",
+        "upload_title",
         "selection_pitch",
         "hook_line",
         "protagonist_presence",
@@ -793,6 +860,11 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         result["target_duration_sec"] = round(duration, 1)
     elif duration <= 0:
         return False, "Invalid target_duration_sec."
+    if duration <= MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC:
+        return False, (
+            f"source_clips duration must be longer than {MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC:.0f} seconds; "
+            "do not create ultra-short packages."
+        )
 
     ok, message = validate_clip_plan(
         clips,
@@ -800,10 +872,17 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         max_clip_duration=MAX_FINAL_CLIP_DURATION_SEC,
         label="source_clips",
         enforce_total_duration=False,
-        enforce_max_clip_duration=False,
+        enforce_max_clip_duration=True,
     )
     if not ok:
         return False, message
+    jump_cuts = visible_jump_cut_count(clips)
+    required_jump_cuts = MIN_VISIBLE_JUMP_CUTS_LONG if duration >= 20.0 else MIN_VISIBLE_JUMP_CUTS
+    if duration >= 8.0 and jump_cuts < required_jump_cuts:
+        return False, (
+            f"source_clips needs at least {required_jump_cuts} visible jump cuts for this duration; "
+            "do not package one long continuous scene."
+        )
 
     raw_narration = result.get("narration", [])
     if not isinstance(raw_narration, list):
@@ -849,6 +928,67 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         if len(captions) >= 3:
             break
     result["point_captions"] = captions
+
+    raw_effects = result.get("sound_effects", [])
+    if not isinstance(raw_effects, list):
+        return False, "sound_effects must contain 0 to 3 items."
+    sound_effects = []
+    for item in raw_effects:
+        if not isinstance(item, dict):
+            continue
+        cue = str(item.get("cue") or "").strip().lower()
+        if cue not in SOUND_EFFECT_CUES:
+            continue
+        try:
+            target_start = float(item.get("target_start"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            volume = float(item.get("volume", 0.24))
+        except (TypeError, ValueError):
+            volume = 0.24
+        if 0.0 <= target_start <= duration:
+            sound_effects.append(
+                {
+                    "cue": cue,
+                    "target_start": round(target_start, 3),
+                    "volume": round(min(0.45, max(0.10, volume)), 3),
+                    "reason": str(item.get("reason") or "").strip()[:120],
+                }
+            )
+        if len(sound_effects) >= MAX_SOUND_EFFECTS:
+            break
+    result["sound_effects"] = sound_effects
+
+    experiment = result.get("experiment")
+    if not isinstance(experiment, dict):
+        return False, "Missing experiment record."
+    hypothesis = str(experiment.get("hypothesis") or "").strip()
+    primary_variable = str(experiment.get("primary_variable") or "").strip()
+    success_signal = str(experiment.get("success_signal") or "").strip()
+    choices = experiment.get("choices")
+    allowed_variables = {"hook_order", "cut_rhythm", "caption_emphasis", "sound_effect", "visual_reframe", "reaction_payoff"}
+    if not hypothesis or primary_variable not in allowed_variables or not success_signal:
+        return False, "experiment requires hypothesis, valid primary_variable, and success_signal."
+    if not isinstance(choices, list) or not 2 <= len(choices) <= 4:
+        return False, "experiment.choices must contain 2 to 4 items."
+    normalized_choices = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        area = str(choice.get("area") or "").strip()
+        decision = str(choice.get("decision") or "").strip()
+        reason = str(choice.get("reason") or "").strip()
+        if area and decision and reason:
+            normalized_choices.append({"area": area[:40], "decision": decision[:180], "reason": reason[:180]})
+    if not 2 <= len(normalized_choices) <= 4:
+        return False, "experiment.choices need area, decision, and reason."
+    result["experiment"] = {
+        "hypothesis": hypothesis[:240],
+        "primary_variable": primary_variable,
+        "choices": normalized_choices,
+        "success_signal": success_signal[:180],
+    }
 
     fun_tags = result.get("fun_tags", [])
     if not isinstance(fun_tags, list) or len(fun_tags) < 1:
@@ -925,7 +1065,11 @@ def model_json_validated(
             user_prompt
             + "\n\nYour previous JSON failed validation.\n"
             + f"Validation error: {message}\n"
-            + "Return corrected JSON only. Do not omit required fields."
+            + "Return corrected JSON only. Do not omit required fields. "
+            + "Before responding, calculate every source_end - source_start yourself: each source_clips item must be 8.0 seconds or shorter. "
+            + "For every final short longer than 20 seconds, source_clips must total more than 20 seconds and contain at least three real source-time skips of 0.5 seconds or more. "
+            + "Do not fake this by splitting one continuous exchange: explicitly arrange a later hook, earlier context, escalation/proof, reaction, and payoff from distinct source moments. "
+            + "Return the full corrected source_clips list, not only the changed item."
         )
     raise RuntimeError(f"Model output failed validation after {MAX_RETRIES} tries: {last_error}")
 
@@ -2426,7 +2570,12 @@ Candidate pool:
 """
 
 
-def build_packaging_prompt(candidate: dict, context_segments: list[dict], rank: int) -> str:
+def build_packaging_prompt(
+    candidate: dict,
+    context_segments: list[dict],
+    rank: int,
+    repair_note: str = "",
+) -> str:
     short_id = f"short_{rank:02d}"
     blueprint = candidate.get("clip_blueprint", []) or []
     blueprint_total = total_clip_duration_sec(blueprint)
@@ -2449,11 +2598,12 @@ Candidate clip blueprint total duration: {blueprint_total:.1f} seconds
 
 Task:
 - Create a final shorts package for CapCut rough-cut generation.
+{repair_note}
 - When an Active orchestration learning rule is present, preserve its required change in the final source_clips. Do not silently revert to the previous default edit structure.
 - If this package is driven by audience comments about a visual subject, make that subject visible in the title, hook, and clip purposes.
-- The final short often works around {TARGET_DURATION_MIN:.0f} to {TARGET_DURATION_MAX:.0f} seconds, but story flow matters more than this preference.
+- The final short must run longer than {MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC:.0f} seconds. It should usually run {TARGET_DURATION_MIN:.0f} to {TARGET_DURATION_MAX:.0f} seconds; let a clear story run longer when needed, but never pad it.
 - It must be reconstructable into at least {MIN_CLIP_COUNT} cuts.
-- source_clips should usually contain {RECOMMENDED_CLIP_COUNT_MIN} to {RECOMMENDED_CLIP_COUNT_MAX} cuts and never fewer than {MIN_CLIP_COUNT}
+- source_clips should usually contain {RECOMMENDED_CLIP_COUNT_MIN} to {RECOMMENDED_CLIP_COUNT_MAX} cuts and never fewer than {MIN_CLIP_COUNT}; this must feel like an edited short, not one continuous longform sequence
 - if the event feels simple, split reaction, pause, reveal, and aftermath into separate cuts
 - source_clips are the playback order of the short
 - source order may be rearranged for hook and flow, but only when clarity is preserved
@@ -2474,9 +2624,14 @@ Task:
 - the first source_clips item must be the hook
 - if the hook is pulled from a later moment, the next 1 to 2 cuts must restore minimum context immediately
 - the last source_clips item must land on payoff, reveal, reaction, or aftermath
-- let source_clips run shorter or longer when the scene flow needs it; do not add padding just to hit a duration
+- keep source_clips tight and purposeful; when a longer story is necessary, add meaningful cuts rather than padding a continuous recap
 - target_duration_sec should match the actual sum of source_clips durations, rounded to about 0.1 seconds
-- each individual clip usually works best around 1 to 8 seconds, but can be longer when the reaction or setup needs breathing room
+- each individual clip must be 1 to {MAX_FINAL_CLIP_DURATION_SEC:.0f} seconds; cut even a continuous reaction into distinct visual or conversational beats
+- Reverse-engineered reference shorts are evidence about editorial judgment, not templates. Never reuse their timestamps, clip order, cut count, title shape, caption wording, or a fixed hook-to-payoff sequence. Build a new sequence from the current source's own strongest question, evidence, reaction, and consequence.
+- For every short 8 seconds or longer, include at least {MIN_VISIBLE_JUMP_CUTS} visible jump cuts between non-adjacent source moments; for 20 seconds or longer include at least {MIN_VISIBLE_JUMP_CUTS_LONG}. Adjacent ranges split at the same moment do not count as cuts.
+- Choose the opening order from the current event, not from a formula: an outcome-first opening is useful only when one later cut can restore the missing context; a chronological opening is useful only when the trigger itself is immediately watchable. Reject either order if it leaves a first-time viewer confused.
+- Normal source beats should be about 1.2 to 3.8 seconds. Reserve a longer hold only for the one indispensable final dialogue/reaction exchange; never fill the short with a continuously playing setup scene.
+- Every jump must add a different job chosen for this source: context, proof, escalation, contradiction, another person's reaction, or consequence. Before finalizing, verify that removing any middle cut would weaken the current story; do not create fake cuts by repeatedly dividing a single uninterrupted exchange.
 - for non-contiguous montage packages, any evidence clip longer than 8 seconds should be split unless it contains one uninterrupted trigger/reaction exchange
 - do not pad with long unbroken context if a tighter reaction or bridge cut would work
 - title must be exactly 2 lines in Korean
@@ -2491,7 +2646,8 @@ Task:
 - for Korean celebrity YouTube/talk, line 1 should name the trigger, person, object, or situation; line 2 should name the reaction, reversal, or payoff
 - do not reuse titles or motifs from reference shorts unless the current source independently contains them
 - do not use fixed title templates; title wording must come from the current source
-- upload_title must be one copy-ready Korean YouTube Shorts upload title that combines the hook and payoff naturally; include 1 to 3 compact hashtags only when useful
+- for a strong comic, excessive, confused, or unexpected beat, use at most one current Korean comment-style meme phrase in either a title line, upload_title, or point caption. Good shapes include "얼마나 [행동]한지 감도 안 옴 ㅋㅋㅋ", "이게 맞아?ㅋㅋ", or "갑자기 분위기 [반전]". Use one only when the visible scene proves it; never force a meme into a serious, emotional, or neutral scene.
+- upload_title must be one copy-ready Korean YouTube Shorts upload title that combines the hook and payoff naturally. Do not add hashtags here; hashtags are handled separately.
 - selection_pitch must explain in one Korean sentence why a human would want to click this short
 - evaluation_notes must explain how title intention, semantic meaning, and source clip structure line up for this candidate
 - timeline_answerability should be high only when a human could match this package to one clear gold timeline answer
@@ -2504,6 +2660,12 @@ Task:
 - narration should be omitted unless needed
 - point_captions must contain 0 to 3 items; keep only the strongest caption beats
 - point caption times must be relative to the short timeline
+- write point captions like a real Korean variety-show editor, not an AI summary: short, spoken, playful, and specific to the visible beat
+- when the source contains a clear laugh, fail, surprise, or group reaction, natural internet-style reactions such as "ㅋㅋㅋ", "이게 맞아?", or "와 이걸 맞히네" are welcome; never force them into a serious or neutral beat
+- avoid stiff wording such as "압권", "클릭할 수밖에", "최고의 순간", or "쇼츠입니다"
+- sound_effects may contain 0 to {MAX_SOUND_EFFECTS} cues. Use them sparingly: only for a visible entrance, transition, surprise, impact, correct/wrong answer, awkward silence, or applause payoff.
+- choose cue from: {", ".join(sorted(SOUND_EFFECT_CUES))}. Place it exactly on the related beat, keep volume around 0.18 to 0.32, and never use an effect where it would cover dialogue or feel forced.
+- experiment is mandatory. Choose exactly one primary_variable from hook_order, cut_rhythm, caption_emphasis, sound_effect, visual_reframe, reaction_payoff. State a testable Korean hypothesis, 2 to 4 actual choices in this package, and a success signal. If no sound effect is used, do not claim one.
 - narration target_start must also be relative to the short timeline
 - use natural Korean suitable for the source type; for YouTube variety/talk, prefer casual entertainment phrasing over movie recap phrasing
 - avoid bland generic phrasing
@@ -2585,6 +2747,23 @@ Return JSON with this exact shape:
       "text": "짧은 포인트 자막"
     }}
   ],
+  "sound_effects": [
+    {{
+      "cue": "surprise",
+      "target_start": 3.0,
+      "volume": 0.24,
+      "reason": "예상 밖 반응이 시작되는 순간"
+    }}
+  ],
+  "experiment": {{
+    "hypothesis": "반응 장면을 먼저 보여주면 초반 이탈을 줄일 수 있다",
+    "primary_variable": "hook_order",
+    "choices": [
+      {{"area": "opening", "decision": "후반의 표정 반응을 첫 컷으로 배치", "reason": "상황의 이상함을 바로 보여주기 위해"}},
+      {{"area": "context", "decision": "다음 두 컷에서 원인만 짧게 복구", "reason": "훅 뒤의 혼란을 줄이기 위해"}}
+    ],
+    "success_signal": "1~3시간 평균 시청률과 조회수 초기 반응"
+  }},
   "edit_notes": [
     "훅 컷을 먼저 열고 필요한 문맥만 보강",
     "마지막은 설명보다 반응으로 끊기"
@@ -2716,6 +2895,7 @@ def run_final_packaging(
     force: bool,
 ) -> list[dict]:
     final_packages = []
+    packaging_failures: list[dict] = []
     ordered = sorted(selected, key=lambda x: x["global_rank"])
     total = len(ordered)
     for index, item in enumerate(ordered, start=1):
@@ -2744,14 +2924,62 @@ def run_final_packaging(
                 print(f"[package] cached final package candidate changed -> {package_name}", flush=True)
         if result is None:
             print(f"[package] requesting final package -> {package_name}", flush=True)
-            result = model_json_validated(
-                client,
-                model,
-                PACKAGING_SYSTEM,
-                build_packaging_prompt(candidate, context_segments, int(item["global_rank"])),
-                validate_final_result,
-                max_completion_tokens=PACKAGING_MAX_COMPLETION_TOKENS,
-            )
+            try:
+                result = model_json_validated(
+                    client,
+                    model,
+                    PACKAGING_SYSTEM,
+                    build_packaging_prompt(candidate, context_segments, int(item["global_rank"])),
+                    validate_final_result,
+                    max_completion_tokens=PACKAGING_MAX_COMPLETION_TOKENS,
+                )
+            except RuntimeError as exc:
+                message = str(exc)
+                # Repair from the same longform before discarding the story.
+                # The first pass is allowed to follow the local blueprint;
+                # this pass must rebuild the montage around the validator's
+                # concrete failure with a wider transcript window.
+                print(
+                    f"[package] repairing final candidate -> {item['candidate_id']}: {message}",
+                    flush=True,
+                )
+                try:
+                    repair_context = extract_window(
+                        merged_segments,
+                        float(candidate.get("candidate_start") or 0.0),
+                        float(candidate.get("candidate_end") or 0.0),
+                        pad_sec=45.0,
+                    )
+                    if not repair_context:
+                        repair_context = context_segments
+                    repair_note = f"""\nRepair pass — the first edit plan failed this exact production check:\n{message}\nRebuild from the same longform using the wider transcript context below. You may change the clip blueprint order and choose different transcript beats, but preserve the same core event. For a jump-cut failure, explicitly choose at least six clips across hook, context, escalation, reaction, and payoff with three or more source-time gaps of 0.5 seconds or greater. For a duration failure, make the actual sum longer than {MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC:.0f} seconds without padding. State these changes honestly in experiment.choices.\n"""
+                    result = model_json_validated(
+                        client,
+                        model,
+                        PACKAGING_SYSTEM,
+                        build_packaging_prompt(
+                            candidate,
+                            repair_context,
+                            int(item["global_rank"]),
+                            repair_note=repair_note,
+                        ),
+                        validate_final_result,
+                        max_completion_tokens=PACKAGING_MAX_COMPLETION_TOKENS,
+                    )
+                except RuntimeError as repair_exc:
+                    packaging_failures.append(
+                        {
+                            "candidate_id": item["candidate_id"],
+                            "global_rank": item["global_rank"],
+                            "error": str(repair_exc),
+                            "initial_error": message,
+                        }
+                    )
+                    print(
+                        f"[package] skipping unrepaired final candidate -> {item['candidate_id']}: {repair_exc}",
+                        flush=True,
+                    )
+                    continue
         result["candidate_id"] = item["candidate_id"]
         result["global_rank"] = item["global_rank"]
         result["global_score"] = item["global_score"]
@@ -2770,6 +2998,11 @@ def run_final_packaging(
         save_json(out_path, result)
         print(f"[package] saved final package -> {package_name}", flush=True)
         final_packages.append(result)
+    if packaging_failures:
+        save_json(OUTPUT_DIR / "final" / "packaging_failures.json", {"failures": packaging_failures})
+        print(f"[package] skipped_invalid_final_candidates={len(packaging_failures)}", flush=True)
+    if not final_packages:
+        raise RuntimeError("No final candidate passed the short-form editing rules. Please run packaging again.")
     return final_packages
 
 

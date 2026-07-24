@@ -28,6 +28,17 @@ DEFAULT_TEMPLATE_IMAGE_CANDIDATES = [
 TITLE_LINE1_BOX = (285, 108, 1050, 205)
 TITLE_LINE2_BOX = (130, 205, 1040, 325)
 CHANNEL_BOX = (0, 1515, 1080, 1610)
+SFX_DIR = BASE_DIR / "필수 효과음 100종"
+SFX_FILE_HINTS = {
+    "entrance": ("01-9 띠링", "01-8 뽕", "01-7 띵"),
+    "transition": ("06-1 훅", "06-2 훅", "06-3 훅"),
+    "surprise": ("29 띠요옹", "05-6 띠요옹"),
+    "impact": ("18 뚜둥탁", "12-2 충격적인 등장", "12-1 극적인 순간"),
+    "correct": ("02-6 QnA 띠리링", "02-7 QnA 정답"),
+    "wrong": ("02-9 틀렸을 때", "02-7 QnA 삐익"),
+    "awkward": ("30 어이없는 상황", "05-3 오리 꽥"),
+    "applause": ("03-11 박수+환호", "25-1 응원 소리"),
+}
 
 
 def configure_stdout() -> None:
@@ -286,7 +297,7 @@ def build_caption_ass(package: dict, output_path: Path) -> Path:
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        f"Style: Point,{font_name},74,&H00FFFFFF,&H000000FF,&H00101010,&H9A000000,-1,0,0,0,100,100,0,0,1,9,3,2,70,70,500,1",
+        f"Style: Point,{font_name},74,&H00FFFFFF,&H000000FF,&H00101010,&H9A000000,-1,0,0,0,100,100,0,0,1,8,3,2,70,70,760,1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -308,7 +319,41 @@ def default_output_path(package_path: Path) -> Path:
     return package_path.parent.parent.parent / "productions" / f"{package_path.stem}.mp4"
 
 
-def build_filter(clips: list[dict], include_audio: bool, captions_path: Path | None) -> str:
+def resolve_sound_effect(cue: str) -> Path | None:
+    if not SFX_DIR.exists():
+        return None
+    files = sorted(path for path in SFX_DIR.iterdir() if path.is_file() and path.suffix.lower() in {".mp3", ".wav", ".m4a", ".aac", ".ogg"})
+    for hint in SFX_FILE_HINTS.get(cue, ()):
+        match = next((path for path in files if hint.casefold() in path.name.casefold()), None)
+        if match:
+            return match
+    return None
+
+
+def resolved_sound_effects(package: dict) -> list[dict]:
+    resolved: list[dict] = []
+    for item in package.get("sound_effects", []) or []:
+        if not isinstance(item, dict):
+            continue
+        cue = str(item.get("cue") or "").strip().lower()
+        path = resolve_sound_effect(cue)
+        if not path:
+            continue
+        try:
+            target_start = max(0.0, float(item.get("target_start") or 0.0))
+        except (TypeError, ValueError):
+            target_start = 0.0
+        try:
+            volume = min(0.45, max(0.10, float(item.get("volume", 0.24))))
+        except (TypeError, ValueError):
+            volume = 0.24
+        resolved.append({"cue": cue, "path": path, "target_start": target_start, "volume": volume})
+        if len(resolved) >= 3:
+            break
+    return resolved
+
+
+def build_filter(clips: list[dict], include_audio: bool, captions_path: Path | None, sound_effects: list[dict]) -> str:
     parts: list[str] = []
     concat_inputs: list[str] = []
     for index, clip in enumerate(clips):
@@ -329,6 +374,17 @@ def build_filter(clips: list[dict], include_audio: bool, captions_path: Path | N
             concat_inputs.append(f"[a{index}]")
     if include_audio:
         parts.append(f"{''.join(concat_inputs)}concat=n={len(clips)}:v=1:a=1[vconcat][aconcat]")
+        if sound_effects:
+            effect_labels = []
+            for index, effect in enumerate(sound_effects):
+                delay_ms = max(0, round(float(effect["target_start"]) * 1000))
+                input_index = 3 + index
+                label = f"sfx{index}"
+                parts.append(f"[{input_index}:a]adelay={delay_ms}:all=1,volume={float(effect['volume']):.3f}[{label}]")
+                effect_labels.append(f"[{label}]")
+            parts.append(f"[aconcat]{''.join(effect_labels)}amix=inputs={len(effect_labels) + 1}:duration=first:dropout_transition=0[aout]")
+        else:
+            parts.append("[aconcat]anull[aout]")
     else:
         parts.append(f"{''.join(concat_inputs)}concat=n={len(clips)}:v=1:a=0[vconcat]")
 
@@ -382,7 +438,8 @@ def main() -> None:
         captions_path.unlink()
 
     include_audio = has_audio_track(source_video)
-    filter_complex = build_filter(clips, include_audio, None if args.no_point_captions else captions_path)
+    sound_effects = resolved_sound_effects(package) if include_audio else []
+    filter_complex = build_filter(clips, include_audio, None if args.no_point_captions else captions_path, sound_effects)
     command = [
         imageio_ffmpeg.get_ffmpeg_exe(),
         "-y",
@@ -403,13 +460,12 @@ def main() -> None:
         str(FPS),
         "-i",
         str(overlay_path),
-        "-filter_complex",
-        filter_complex,
-        "-map",
-        "[vout]",
     ]
+    for effect in sound_effects:
+        command.extend(["-i", str(effect["path"])])
+    command.extend(["-filter_complex", filter_complex, "-map", "[vout]"])
     if include_audio:
-        command.extend(["-map", "[aconcat]"])
+        command.extend(["-map", "[aout]"])
     command.extend(
         [
             "-c:v",
@@ -433,6 +489,8 @@ def main() -> None:
     print(f"[render] text_overlay={overlay_path}", flush=True)
     if not args.no_point_captions:
         print(f"[render] captions={captions_path}", flush=True)
+    for effect in sound_effects:
+        print(f"[render] sound_effect={effect['cue']} at={effect['target_start']:.2f}s file={effect['path'].name}", flush=True)
 
 
 if __name__ == "__main__":

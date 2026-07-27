@@ -1483,7 +1483,9 @@ class Long2ShortsApp:
 
     def update_stages_from_log(self, line: str) -> None:
         stage_payload = None
-        if line.startswith("[orchestrator] phase=trend_research"):
+        if line.startswith("[orchestrator] phase=channel_audit"):
+            stage_payload = {"key": "trend", "status": "진행", "note": "최근 업로드의 저작권·중복·차단 상태 점검 중"}
+        elif line.startswith("[orchestrator] phase=trend_research"):
             stage_payload = {"key": "trend", "status": "진행", "note": "트렌드 신호 조사 중"}
         elif line.startswith("[orchestrator] phase=source_acquisition"):
             stage_payload = {"key": "media", "status": "진행", "note": "선정 롱폼 다운로드/전사 준비 중"}

@@ -249,7 +249,11 @@ class Long2ShortsTelegramBot:
 
     def review_source_summary(self, row: dict[str, Any]) -> str:
         package_path = Path(str(row.get("package_path") or "")).resolve()
-        context = read_json(package_path.parent.parent.parent / "youtube_context.json", {})
+        analysis_dir = next(
+            (parent for parent in package_path.parents if (parent / "youtube_context.json").exists()),
+            package_path.parent.parent.parent,
+        )
+        context = read_json(analysis_dir / "youtube_context.json", {})
         if not isinstance(context, dict):
             return ""
         metadata = context.get("metadata", {}) if isinstance(context.get("metadata"), dict) else {}
@@ -390,6 +394,7 @@ class Long2ShortsTelegramBot:
     @staticmethod
     def phase_message(phase: str) -> str:
         messages = {
+            "channel_audit": "\ucd5c\uadfc \uc5c5\ub85c\ub4dc\uc758 \uc800\uc791\uad8c\u00b7\uc911\ubcf5\u00b7\ucc28\ub2e8 \uc0c1\ud0dc\ub97c \uc810\uac80\ud558\uace0 \uc788\uc5b4\uc694.",
             "metrics_sync": "\uc774\uc804 \uc5c5\ub85c\ub4dc \uae30\ub85d\uc744 \ud655\uc778\ud558\uace0 \uc788\uc5b4\uc694.",
             "learning_rule": "\uc774\uc804 \uac80\ud1a0 \uc758\uacac\uc744 \uc815\ub9ac\ud558\uace0 \uc788\uc5b4\uc694.",
             "trend_research": "\uc624\ub298\uc758 \uc6d0\ubcf8 \ud6c4\ubcf4\ub97c \ucc3e\uace0 \uc788\uc5b4\uc694.",

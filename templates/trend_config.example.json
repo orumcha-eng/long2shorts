@@ -5,14 +5,14 @@
     "under_48_hours": 2,
     "under_72_hours": 1
   },
-  "candidate_limit": 20,
+  "candidate_limit": 50,
   "monitor_interval_minutes": 10,
   "search_results_per_query": 20,
   "video_category_ids": ["24", "23"],
   "minimum_selection_score": 0,
   "minimum_production_source_duration_sec": 480,
   "expand_chart_channels": true,
-  "longform_channel_seed_limit": 30,
+  "longform_channel_seed_limit": 50,
   "min_duration_sec": 0,
   "max_duration_sec": 999999,
   "region_code": "KR",
@@ -21,11 +21,12 @@
   "green_channel_keywords": [],
   "block_title_keywords": [],
   "excluded_title_keywords": [
-    "런닝맨",
-    "running man"
+    "런닝맨", "running man", "| kbs", "| sbs", "| mbc", "| jtbc", "| tvn", "| ebs",
+    "kbs 방송", "sbs 방송", "mbc 방송", "jtbc 방송", "tvn 방송", "ebs 방송"
   ],
   "excluded_channel_keywords": [
-    "런닝맨 - 스브스 공식 채널"
+    "런닝맨 - 스브스 공식 채널", "kbs", "sbs", "mbc", "jtbc", "tvn", "ebs", "mbn",
+    "채널a", "channel a", "tv chosun", "tv조선", "ytn", "연합뉴스tv", "tvpp", "tv-people"
   ],
   "skip_title_keywords": []
 }

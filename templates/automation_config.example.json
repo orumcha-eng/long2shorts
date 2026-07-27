@@ -16,7 +16,7 @@
     "enabled": true,
     "config_path": "templates/trend_config.example.json",
     "window_hours": 72,
-    "candidate_limit": 20
+      "candidate_limit": 50
   },
   "source_acquisition": {
     "enabled": true,
@@ -30,9 +30,17 @@
   },
   "benchmark_profile": "templates/benchmark_profiles/rescene_gyaru_variety.json",
   "generation": {
-    "model": "gpt-4.1-mini",
+    "candidate_model": "gpt-5.4",
+    "final_model": "gpt-5.6-sol",
     "include_wide_windows": true,
     "force": false
+  },
+  "visual_events": {
+    "enabled": true,
+    "model": "gpt-5.4",
+    "sample_interval_sec": 12,
+    "frames_per_batch": 6,
+    "max_frames": 180
   },
   "production": {
     "enabled": true,
@@ -44,8 +52,20 @@
   "source_safety": {
     "enabled": true,
     "require_verified_owned_source": false,
-    "blocked_terms": ["런닝맨", "running man"],
-    "blocked_channels": ["런닝맨 - 스브스 공식 채널"]
+    "blocked_terms": ["런닝맨", "running man", "정치", "대통령", "민주당", "국민의힘", "선거", "국회", "이재명", "한동훈"],
+    "blocked_channels": [
+      "런닝맨 - 스브스 공식 채널", "개그콘서트", "KBS Entertain", "KBS Drama", "KBS Joy",
+      "SBS Entertainment", "SBS Plus", "SBS Catch", "MBCentertainment", "MBC every1", "TV-People", "TVPP",
+      "JTBC Entertainment", "tvN D ENT", "TVCHOSUN - TV조선", "놀면 뭐하니?", "어서와 한국은 처음이지"
+    ],
+    "blocked_channel_keywords": [
+      "kbs", "sbs", "mbc", "jtbc", "tvn", "ebs", "mbn", "채널a", "channel a",
+      "tv chosun", "tv조선", "ytn", "연합뉴스tv", "kbs world", "sbs now"
+    ],
+    "blocked_source_title_keywords": [
+      "| kbs", "| sbs", "| mbc", "| jtbc", "| tvn", "| ebs", "kbs 방송", "sbs 방송",
+      "mbc 방송", "jtbc 방송", "tvn 방송", "ebs 방송"
+    ]
   },
   "review": {
     "enabled": true

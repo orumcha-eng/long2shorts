@@ -25,7 +25,7 @@ USER_AGENT = "Long2Shorts/0.1"
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "window_hours": 72,
-    "candidate_limit": 20,
+    "candidate_limit": 50,
     "search_results_per_query": 20,
     "video_category_ids": ["24", "23"],
     "minimum_selection_score": 100,
@@ -242,6 +242,38 @@ def collect_ids_from_api(config: dict[str, Any], api_key: str, published_after: 
                 seen.add(video_id)
                 ids.append(video_id)
 
+    # This is deliberately opt-in. The normal monitor remains chart-led and
+    # inexpensive. If every chart-channel longform is excluded by policy, the
+    # producer can make one category-only API request: no fixed show or person
+    # keywords, just recent medium-length videos ranked by public views.
+    if bool(config.get("broad_longform_discovery", False)):
+        for category_id in config.get("video_category_ids", ["24", "23"]) or []:
+            try:
+                data = youtube_api_get(
+                    "search",
+                    {
+                        "part": "snippet",
+                        "type": "video",
+                        "videoCategoryId": category_id,
+                        "regionCode": region_code,
+                        "relevanceLanguage": language,
+                        "publishedAfter": published_after.isoformat().replace("+00:00", "Z"),
+                        "order": "viewCount",
+                        "videoDuration": "medium",
+                        "safeSearch": "moderate",
+                        "maxResults": 50,
+                    },
+                    api_key,
+                )
+            except Exception as exc:
+                print(f"[trend] broad_longform_search_error={category_id}:{exc}", flush=True)
+                continue
+            for item in data.get("items", []) or []:
+                video_id = ((item.get("id") or {}).get("videoId") or "").strip()
+                if video_id and video_id not in seen:
+                    seen.add(video_id)
+                    ids.append(video_id)
+
     for query in config.get("queries", []) or []:
         try:
             data = youtube_api_get(
@@ -286,28 +318,13 @@ def fetch_video_details_api(ids: list[str], api_key: str) -> list[dict[str, Any]
     return items
 
 
-def collect_recent_longform_from_chart_channels(
-    seed_items: list[dict[str, Any]],
+def collect_recent_longform_from_channel_ids(
+    channel_ids: list[str],
     config: dict[str, Any],
     api_key: str,
 ) -> list[dict[str, Any]]:
-    """Find recent longform uploads from channels that are hot in the chart.
-
-    ``videos.list(chart=mostPopular)`` is often dominated by Shorts.  This
-    expands only from those chart channels, rather than inventing keyword
-    searches, then lets the same category/date/engagement ranking decide.
-    """
-    channel_ids: list[str] = []
-    seen_channels: set[str] = set()
-    channel_limit = max(1, min(50, int(config.get("longform_channel_seed_limit") or 30)))
-    for item in seed_items:
-        snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
-        channel_id = str(snippet.get("channelId") or "")
-        if channel_id and channel_id not in seen_channels:
-            seen_channels.add(channel_id)
-            channel_ids.append(channel_id)
-        if len(channel_ids) >= channel_limit:
-            break
+    """Fetch recent uploads for an already-ranked list of channel IDs."""
+    channel_ids = list(dict.fromkeys(channel_ids))[:50]
     if not channel_ids:
         return []
 
@@ -343,6 +360,48 @@ def collect_recent_longform_from_chart_channels(
                 seen_video_ids.add(video_id)
                 video_ids.append(video_id)
     return fetch_video_details_api(video_ids, api_key)
+
+
+def collect_recent_longform_from_chart_channels(
+    seed_items: list[dict[str, Any]],
+    config: dict[str, Any],
+    api_key: str,
+) -> list[dict[str, Any]]:
+    """Expand from current YouTube chart channels without keyword searches."""
+    channel_ids: list[str] = []
+    seen_channels: set[str] = set()
+    channel_limit = max(1, min(50, int(config.get("longform_channel_seed_limit") or 50)))
+    for item in seed_items:
+        snippet = item.get("snippet") if isinstance(item.get("snippet"), dict) else {}
+        channel_id = str(snippet.get("channelId") or "")
+        if channel_id and channel_id not in seen_channels:
+            seen_channels.add(channel_id)
+            channel_ids.append(channel_id)
+        if len(channel_ids) >= channel_limit:
+            break
+    return collect_recent_longform_from_channel_ids(channel_ids, config, api_key)
+
+
+def collect_playboard_ranked_channel_ids(config: dict[str, Any]) -> list[str]:
+    """Read the public Korean entertainment daily channel ranking as a fallback.
+
+    This gives us a dynamic channel pool instead of hard-coding programme or
+    celebrity names. The caller still applies all broadcaster and rights
+    filters before a source is downloaded.
+    """
+    url = str(
+        config.get("playboard_channel_ranking_url")
+        or "https://playboard.co/youtube-ranking/most-popular-entertainment-channels-in-south-korea-daily"
+    )
+    try:
+        request = Request(url, headers={"User-Agent": USER_AGENT})
+        with urlopen(request, timeout=25) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        print(f"[trend] playboard_ranking_error={exc}", flush=True)
+        return []
+    limit = max(1, min(50, int(config.get("playboard_channel_seed_limit") or 50)))
+    return list(dict.fromkeys(re.findall(r'href="/channel/(UC[A-Za-z0-9_-]{22})"', html)))[:limit]
 
 
 def yt_dlp_json(args: list[str]) -> dict[str, Any] | None:
@@ -533,6 +592,12 @@ def discover_candidates(
                 raw_items.extend(collect_recent_longform_from_chart_channels(raw_items, config, api_key))
             except Exception as exc:
                 print(f"[trend] longform_channel_expansion_error={exc}", flush=True)
+        if bool(config.get("playboard_channel_fallback", False)):
+            try:
+                channel_ids = collect_playboard_ranked_channel_ids(config)
+                raw_items.extend(collect_recent_longform_from_channel_ids(channel_ids, config, api_key))
+            except Exception as exc:
+                print(f"[trend] playboard_channel_expansion_error={exc}", flush=True)
     else:
         raw_items = collect_items_from_ytdlp(config, published_after)
 
@@ -583,6 +648,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default="")
     parser.add_argument("--window-hours", type=int, default=None)
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--broad-longform", action="store_true", help="One-off category-only longform fallback.")
+    parser.add_argument("--playboard-channels", action="store_true", help="One-off public channel-ranking fallback.")
     parser.add_argument("--include-processed", action="store_true")
     parser.add_argument("--mark-processed", action="store_true")
     parser.add_argument("--video-id", default="")
@@ -645,6 +712,10 @@ def main() -> None:
         config["window_hours"] = args.window_hours
     if args.limit is not None:
         config["candidate_limit"] = args.limit
+    if args.broad_longform:
+        config["broad_longform_discovery"] = True
+    if args.playboard_channels:
+        config["playboard_channel_fallback"] = True
 
     api_key = get_api_key(args.api_key)
     result = discover_candidates(config, api_key=api_key, include_processed=args.include_processed)

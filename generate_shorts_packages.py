@@ -29,6 +29,7 @@ BENCHMARK_PROFILE_CONTEXT = ""
 BENCHMARK_PROFILE: dict = {}
 LEARNING_RULE_CONTEXT = ""
 LEARNING_RULE: dict = {}
+VISUAL_EVENTS: list[dict] = []
 DEFAULT_MODEL = "gpt-4.1-mini"
 DEFAULT_TEMPERATURE = 0.2
 CHUNK_TOP_K = 8
@@ -160,7 +161,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional active orchestration rule that must influence candidate selection and packaging.",
     )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Optional isolated candidate batch directory. Defaults to analysis_dir/shorts_candidates.",
+    )
     parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument(
+        "--final-model",
+        default="",
+        help="Higher-capability model used only for final package judgment and edit planning.",
+    )
     parser.add_argument(
         "--no-wide-windows",
         action="store_true",
@@ -178,12 +190,13 @@ def configure_runtime(
     reference_style_path: Optional[Path] = None,
     benchmark_profile_path: Optional[Path] = None,
     learning_rule_path: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
 ) -> None:
-    global ANALYSIS_DIR, TRANSCRIPTS_DIR, MERGED_TRANSCRIPT_PATH, OUTPUT_DIR, SOURCE_TITLE, MOVIE_INFO, YOUTUBE_CONTEXT, REFERENCE_STYLE_CONTEXT, REFERENCE_STYLE_EXAMPLES, BENCHMARK_PROFILE_CONTEXT, BENCHMARK_PROFILE, LEARNING_RULE_CONTEXT, LEARNING_RULE
+    global ANALYSIS_DIR, TRANSCRIPTS_DIR, MERGED_TRANSCRIPT_PATH, OUTPUT_DIR, SOURCE_TITLE, MOVIE_INFO, YOUTUBE_CONTEXT, REFERENCE_STYLE_CONTEXT, REFERENCE_STYLE_EXAMPLES, BENCHMARK_PROFILE_CONTEXT, BENCHMARK_PROFILE, LEARNING_RULE_CONTEXT, LEARNING_RULE, VISUAL_EVENTS
     ANALYSIS_DIR = analysis_dir
     TRANSCRIPTS_DIR = ANALYSIS_DIR / "transcripts"
     MERGED_TRANSCRIPT_PATH = ANALYSIS_DIR / "merged" / "merged_transcript.json"
-    OUTPUT_DIR = ANALYSIS_DIR / "shorts_candidates"
+    OUTPUT_DIR = output_dir.resolve() if output_dir else ANALYSIS_DIR / "shorts_candidates"
     SOURCE_TITLE = source_title.strip() or analysis_dir.name
     if movie_info_path and movie_info_path.exists():
         with open(movie_info_path, "r", encoding="utf-8") as f:
@@ -201,6 +214,15 @@ def configure_runtime(
     BENCHMARK_PROFILE_CONTEXT = format_benchmark_profile(BENCHMARK_PROFILE)
     LEARNING_RULE = load_learning_rule(learning_rule_path)
     LEARNING_RULE_CONTEXT = format_learning_rule(LEARNING_RULE)
+    visual_path = ANALYSIS_DIR / "visual_events" / "visual_event_script.json"
+    if visual_path.exists():
+        try:
+            visual_payload = json.loads(visual_path.read_text(encoding="utf-8"))
+            VISUAL_EVENTS = visual_payload.get("events", []) if isinstance(visual_payload, dict) else []
+        except (OSError, json.JSONDecodeError):
+            VISUAL_EVENTS = []
+    else:
+        VISUAL_EVENTS = []
     if BENCHMARK_PROFILE:
         REFERENCE_STYLE_CONTEXT = "\n\n".join(
             value
@@ -367,12 +389,15 @@ PACKAGING_SYSTEM = """You package one Korean short for CapCut rough-cut generati
 
 Rules:
 - title must be exactly 2 lines
-- title should feel clickable, specific, and stop-scroll friendly
-- title should reveal the candidate's hook frame quickly when possible
-- title should not read like a calm synopsis
-- title should usually surface trigger, person/role, reaction, or payoff fast
-- for Korean celebrity YouTube/talk sources, write titles like a high-performing entertainment short: casual and punchy when the beat is clearly comic
-- good title shape: line 1 names the trigger/person/object; line 2 names the reaction/reversal/payoff
+- Title is a human editor's mini-headline, not two generic keyword labels. It must identify a person/role, the concrete event, and what changed or was revealed.
+- Write it like a natural Korean entertainment headline that a person would type after actually watching the scene. A complete phrase or compact sentence is welcome; do not force two choppy noun fragments.
+- Good abstract shapes: "[인물]의 [구체적 행동]을 / [결과·반응]한 [상대]", "더 [행동]할수록 / 더 [잃게 된] [인물]", "[인물]이 [대상]을 / 지키려고 택한 방법". These are shapes only: invent wording from the current scene and never reuse names or facts not proven by it.
+- title should feel clickable, specific, and stop-scroll friendly, but never read like a vague slogan, a calm synopsis, or a report label.
+- surface the person/role, trigger, and reaction/reversal/payoff fast whenever the footage proves them.
+- for Korean celebrity YouTube/talk sources, write titles like a high-performing entertainment short: conversational and punchy when the beat is clearly comic.
+- Split one coherent headline naturally across two lines; line 1 and line 2 should read as one sentence when joined, not as two unrelated slogans.
+- A title line may contain 4 to 18 visible Korean characters excluding spaces.
+- Emoji is optional, not decoration. Default to no emoji; if the exact scene genuinely benefits from it, use at most one across both lines and never repeat one fixed emoji across shorts.
 - do not copy reference titles, names, motifs, or wording; infer them from the current transcript
 - if comment evidence exists, use it to sharpen the title, hook_line, selection_pitch, or point captions without quoting viewers directly
 - narration should be omitted unless needed
@@ -439,13 +464,17 @@ def model_json(
 ) -> dict:
     request_kwargs = {
         "model": model,
-        "temperature": temperature,
         "response_format": {"type": "json_object"},
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     }
+    # Current GPT-5 family models accept only their default temperature through
+    # Chat Completions. Omitting the parameter keeps the production route valid
+    # while older models retain the configured sampling behavior.
+    if not model.startswith("gpt-5"):
+        request_kwargs["temperature"] = temperature
     if max_completion_tokens is not None:
         request_kwargs["max_completion_tokens"] = max_completion_tokens
     response = client.chat.completions.create(**request_kwargs)
@@ -866,6 +895,22 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
             "do not create ultra-short packages."
         )
 
+    # Replaying the same source seconds as both "hook" and "context" looks
+    # like a cut on paper but gives a first-time viewer no new information.
+    # Allow only a tiny boundary tolerance between separately selected beats.
+    ordered_source_ranges = []
+    for clip in clips if isinstance(clips, list) else []:
+        if not isinstance(clip, dict):
+            continue
+        try:
+            ordered_source_ranges.append((float(clip.get("source_start")), float(clip.get("source_end"))))
+        except (TypeError, ValueError):
+            continue
+    ordered_source_ranges.sort()
+    for previous, current in zip(ordered_source_ranges, ordered_source_ranges[1:]):
+        if current[0] < previous[1] - 0.5:
+            return False, "source_clips overlap in source time; use distinct evidence, reaction, and payoff beats instead."
+
     ok, message = validate_clip_plan(
         clips,
         target_duration=duration,
@@ -883,6 +928,27 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
             f"source_clips needs at least {required_jump_cuts} visible jump cuts for this duration; "
             "do not package one long continuous scene."
         )
+
+    title_text = " ".join(
+        str(result.get(key) or "") for key in ("title_line1", "title_line2", "upload_title")
+    )
+    for field in ("title_line1", "title_line2"):
+        line = " ".join(str(result.get(field) or "").split())
+        visible_length = len("".join(line.split()))
+        if "..." in line or "…" in line:
+            return False, f"{field} contains an ellipsis; rewrite it as a complete headline."
+        if not 4 <= visible_length <= 18:
+            return False, f"{field} must contain 4 to 18 visible characters; it has {visible_length}."
+    title_emoji_count = sum(
+        1
+        for char in f"{result.get('title_line1') or ''}{result.get('title_line2') or ''}"
+        if 0x1F000 <= ord(char) <= 0x1FAFF or 0x2600 <= ord(char) <= 0x27BF
+    )
+    if title_emoji_count > 1:
+        return False, "Use at most one emoji across the full two-line title; never add a fixed decorative emoji."
+    generic_title_shapes = ("폭발한 순간", "폭발 현장", "감탄 폭발", "웃음 폭발")
+    if any(shape in title_text for shape in generic_title_shapes):
+        return False, "Title uses a generic explosion phrase; name the concrete trigger and payoff instead."
 
     raw_narration = result.get("narration", [])
     if not isinstance(raw_narration, list):
@@ -1105,6 +1171,40 @@ def clean_segments(segments: list[dict]) -> list[dict]:
 
 def format_segments_for_prompt(segments: list[dict]) -> str:
     return "\n".join(f"[{seg['start']:08.3f}-{seg['end']:08.3f}] {seg['text']}" for seg in segments)
+
+
+def format_visual_events_for_prompt(start_sec: float, end_sec: float, pad_sec: float = 20.0) -> str:
+    if not VISUAL_EVENTS:
+        return "Visual event script: unavailable. Do not claim unseen reactions or actions."
+    low = max(0.0, float(start_sec) - pad_sec)
+    high = float(end_sec) + pad_sec
+    compact = []
+    for event in VISUAL_EVENTS:
+        try:
+            event_start = float(event.get("start_sec"))
+            event_end = float(event.get("end_sec"))
+        except (TypeError, ValueError):
+            continue
+        if event_end < low or event_start > high:
+            continue
+        compact.append(
+            {
+                "event_id": event.get("event_id"),
+                "start_sec": event_start,
+                "end_sec": event_end,
+                "context": event.get("context", ""),
+                "visible_setup": event.get("visible_setup", ""),
+                "action": event.get("action", ""),
+                "reaction": event.get("reaction", ""),
+                "payoff": event.get("payoff", ""),
+                "visual_hook": event.get("visual_hook", ""),
+                "characters": event.get("characters", []),
+                "confidence": event.get("confidence", "low"),
+            }
+        )
+    if not compact:
+        return "Visual event script: no verified event near this time range."
+    return "Verified visual events (use only as supported evidence):\n" + json.dumps(compact[:12], ensure_ascii=False, indent=2)
 
 
 ANCHOR_HINT_CATEGORIES = [
@@ -2318,6 +2418,7 @@ Wide-window cross-chunk rule:
     return f"""Source title: {SOURCE_TITLE}
 {format_movie_info_for_prompt()}
 {format_youtube_context_for_prompt(chunk['start_sec'], chunk['end_sec'])}
+{format_visual_events_for_prompt(chunk['start_sec'], chunk['end_sec'])}
 Chunk id: {chunk['chunk_id']}
 Chunk range: {chunk['start_sec']:.3f} to {chunk['end_sec']:.3f}
 {format_reference_style_examples(REFERENCE_STYLE_EXAMPLES, chunk['start_sec'], chunk['end_sec'])}
@@ -2331,6 +2432,7 @@ Task:
 - Each candidate must be a distinct source scene or variety bit with a distinct payoff beat.
 - If benchmark reference calibration is explicitly supplied, use it only as a scoring/debugging lens; do not copy an exact answer skeleton unless the source evidence independently supports that same thread.
 - When an Active orchestration learning rule is present, apply every required constraint to candidate selection, hook order, and clip_blueprint. Do not claim the rule was applied without source evidence.
+- When verified visual events are supplied, treat them as the source of truth for on-screen action, expression, object, framing, and reaction. Prefer a candidate whose hook, setup, and payoff are visibly supported; never invent visual evidence from dialogue alone.
 - Before choosing candidates, mentally separate the transcript into answerable threads, not isolated funny lines.
 - A thread is a repeated tease, object/style motif, promise, accusation, misunderstanding, calculation, process, challenge, transformation, or emotional question that can be named in one title.
 - The candidate should represent the whole answer thread that a human could score against a timeline answer.
@@ -2582,6 +2684,7 @@ def build_packaging_prompt(
     return f"""Source title: {SOURCE_TITLE}
 {format_movie_info_for_prompt()}
 {format_youtube_context_for_prompt(candidate.get('candidate_start'), candidate.get('candidate_end'))}
+{format_visual_events_for_prompt(float(candidate.get('candidate_start', 0.0)), float(candidate.get('candidate_end', 0.0)))}
 Final rank: {rank}
 Target short id: {short_id}
 {format_reference_style_examples(REFERENCE_STYLE_EXAMPLES, candidate.get('candidate_start'), candidate.get('candidate_end'))}
@@ -2600,6 +2703,7 @@ Task:
 - Create a final shorts package for CapCut rough-cut generation.
 {repair_note}
 - When an Active orchestration learning rule is present, preserve its required change in the final source_clips. Do not silently revert to the previous default edit structure.
+- When verified visual events are supplied, title and cut only what those events or the transcript can prove. A visual reaction, prop, expression, or action may be used only when it is listed in the event script near the chosen timestamps.
 - If this package is driven by audience comments about a visual subject, make that subject visible in the title, hook, and clip purposes.
 - The final short must run longer than {MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC:.0f} seconds. It should usually run {TARGET_DURATION_MIN:.0f} to {TARGET_DURATION_MAX:.0f} seconds; let a clear story run longer when needed, but never pad it.
 - It must be reconstructable into at least {MIN_CLIP_COUNT} cuts.
@@ -2632,22 +2736,29 @@ Task:
 - Choose the opening order from the current event, not from a formula: an outcome-first opening is useful only when one later cut can restore the missing context; a chronological opening is useful only when the trigger itself is immediately watchable. Reject either order if it leaves a first-time viewer confused.
 - Normal source beats should be about 1.2 to 3.8 seconds. Reserve a longer hold only for the one indispensable final dialogue/reaction exchange; never fill the short with a continuously playing setup scene.
 - Every jump must add a different job chosen for this source: context, proof, escalation, contradiction, another person's reaction, or consequence. Before finalizing, verify that removing any middle cut would weaken the current story; do not create fake cuts by repeatedly dividing a single uninterrupted exchange.
+- Never reuse the same source seconds as both the hook and the context. Each cut must reveal new information; source time ranges may not materially overlap.
+- Before choosing the first cut, ask: can a first-time viewer identify who is involved, what is happening, and why they should wait for the payoff within the first two cuts? If not, reject the candidate rather than explaining it with a generic title.
+- Reject a candidate when its payoff is only a facial reaction, ordinary driving/room footage, or a vague mood without a concrete triggering line or action.
 - for non-contiguous montage packages, any evidence clip longer than 8 seconds should be split unless it contains one uninterrupted trigger/reaction exchange
 - do not pad with long unbroken context if a tighter reaction or bridge cut would work
 - title must be exactly 2 lines in Korean
-- title_line1 should usually be 4 to 14 visible characters excluding spaces; allow short English tokens when they appear in the source
-- title_line2 should usually be 4 to 14 visible characters excluding spaces
-- write titles as punchy short fragments, not full sentences or recap text
-- line 1 should name the setup, person, or trigger; line 2 should name the reaction, reversal, or payoff
+- title_line1 and title_line2 should each contain 4 to 18 visible characters excluding spaces; allow short English tokens when they appear in the source
+- Write the two lines as one coherent, human-written entertainment headline. The joined lines may form a compact complete sentence; do not reduce it to two stiff keyword fragments or a report label.
+- line 1 should usually identify the person/trigger/action; line 2 should complete its reaction, consequence, reversal, or motive.
 - avoid generic title filler such as "현장", "대공개", "포착", "이유는?", "진심", "모습", and "순간"
 - avoid ellipsis and do not end either title line with "..."
 - title should feel like a high-performing short headline, not a neutral recap
 - title should surface trigger, person/role, reaction, or payoff fast
+- Do not use generic phrases such as "폭발한 순간", "폭발 현장", "감탄 폭발", or "웃음 폭발". State the unusual line, choice, accusation, mistake, or result that actually happens on screen.
 - for Korean celebrity YouTube/talk, line 1 should name the trigger, person, object, or situation; line 2 should name the reaction, reversal, or payoff
 - do not reuse titles or motifs from reference shorts unless the current source independently contains them
 - do not use fixed title templates; title wording must come from the current source
+- Emoji is optional. Use zero by default; never prepend the same decorative emoji to every title. When one is genuinely meaningful, use no more than one across both title lines.
 - for a strong comic, excessive, confused, or unexpected beat, use at most one current Korean comment-style meme phrase in either a title line, upload_title, or point caption. Good shapes include "얼마나 [행동]한지 감도 안 옴 ㅋㅋㅋ", "이게 맞아?ㅋㅋ", or "갑자기 분위기 [반전]". Use one only when the visible scene proves it; never force a meme into a serious, emotional, or neutral scene.
-- upload_title must be one copy-ready Korean YouTube Shorts upload title that combines the hook and payoff naturally. Do not add hashtags here; hashtags are handled separately.
+- upload_title is the actual YouTube upload title, separate from the two-line on-video title. It must be a human-written Korean entertainment headline, not a mechanical concatenation of title_line1 + title_line2.
+- Write upload_title as one natural, specific sentence/phrase (normally 18 to 55 visible Korean characters): name the person or role, concrete action/event, and surprising reaction, consequence, motive, or reversal. It may use different wording from the on-video title.
+- Good abstract upload-title shapes: "[구체적 장면]을 [행동]한 [인물]의 변명", "더 [행동]할수록 더 [결과]가 된 [인물]", "[인물]이 [대상]을 지키려고 택한 방법". These are only human-writing shapes; never fabricate facts, names, relationships, or motives beyond the current footage.
+- Do not use a default emoji, repetitive suffix, generic "이유", or bare keyword list. A single "ㅋㅋ" is allowed only where the visible payoff is genuinely comic; otherwise omit it. Do not add hashtags here; hashtags are handled separately.
 - selection_pitch must explain in one Korean sentence why a human would want to click this short
 - evaluation_notes must explain how title intention, semantic meaning, and source clip structure line up for this candidate
 - timeline_answerability should be high only when a human could match this package to one clear gold timeline answer
@@ -2661,8 +2772,12 @@ Task:
 - point_captions must contain 0 to 3 items; keep only the strongest caption beats
 - point caption times must be relative to the short timeline
 - write point captions like a real Korean variety-show editor, not an AI summary: short, spoken, playful, and specific to the visible beat
+- use one consistent casual editor voice across all captions in the same short. For a clearly comic or awkward beat, natural wording such as "첫입부터 보스전ㅋㅋ", "이거 벌써 불안한데ㅋㅋ", or "바로 초대각ㅋㅋ" is better than a report-style label.
+- ban stiff newsroom/AI label shapes such as "경보 발령", "경고 들어옴", "정량:", "판정", "상황", or "~실력?" unless that exact wording is the on-screen joke. Rephrase them as something a person would actually type after watching.
+- do not attach ㅋㅋ mechanically. Use it only where the visible action, dialogue, or reaction is genuinely comic; vary the phrasing instead of repeating one meme template.
 - when the source contains a clear laugh, fail, surprise, or group reaction, natural internet-style reactions such as "ㅋㅋㅋ", "이게 맞아?", or "와 이걸 맞히네" are welcome; never force them into a serious or neutral beat
 - avoid stiff wording such as "압권", "클릭할 수밖에", "최고의 순간", or "쇼츠입니다"
+- For an entertainment package that passes as auto_render, include exactly one sound effect when the verified visual event script or the selected clips contain a clear entrance, reveal, surprise, impact, correct/wrong answer, awkward silence, or applause payoff. Use zero only when none of those moments is actually present; do not invent a cue merely to meet a quota.
 - sound_effects may contain 0 to {MAX_SOUND_EFFECTS} cues. Use them sparingly: only for a visible entrance, transition, surprise, impact, correct/wrong answer, awkward silence, or applause payoff.
 - choose cue from: {", ".join(sorted(SOUND_EFFECT_CUES))}. Place it exactly on the related beat, keep volume around 0.18 to 0.32, and never use an effect where it would cover dialogue or feel forced.
 - experiment is mandatory. Choose exactly one primary_variable from hook_order, cut_rhythm, caption_emphasis, sound_effect, visual_reframe, reaction_payoff. State a testable Korean hypothesis, 2 to 4 actual choices in this package, and a success signal. If no sound effect is used, do not claim one.
@@ -3066,12 +3181,15 @@ def main() -> None:
         args.reference_style_path.resolve() if args.reference_style_path else None,
         args.benchmark_profile.resolve() if args.benchmark_profile else None,
         args.learning_rule.resolve() if args.learning_rule else None,
+        args.output_dir.resolve() if args.output_dir else None,
     )
 
     ensure_output_dirs()
     print(f"[package] analysis_dir={ANALYSIS_DIR}", flush=True)
     print(f"[package] source_title={SOURCE_TITLE}", flush=True)
-    print(f"[package] model={args.model}", flush=True)
+    final_model = args.final_model.strip() or args.model
+    print(f"[package] candidate_model={args.model}", flush=True)
+    print(f"[package] final_model={final_model}", flush=True)
     if BENCHMARK_PROFILE_CONTEXT:
         print(f"[package] benchmark_profile={args.benchmark_profile}", flush=True)
     if LEARNING_RULE_CONTEXT:
@@ -3116,7 +3234,7 @@ def main() -> None:
     else:
         final_packages = run_final_packaging(
             client=client,
-            model=args.model,
+            model=final_model,
             merged_segments=merged_segments,
             local_candidates_by_id=local_candidates_by_id,
             selected=selected_items,
@@ -3125,7 +3243,8 @@ def main() -> None:
 
         final_payload = {
             "source_title": SOURCE_TITLE,
-            "model": args.model,
+            "candidate_model": args.model,
+            "final_model": final_model,
             "benchmark_profile": {
                 "profile_id": BENCHMARK_PROFILE.get("profile_id", ""),
                 "path": str(args.benchmark_profile) if args.benchmark_profile else "",

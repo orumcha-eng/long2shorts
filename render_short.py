@@ -16,18 +16,24 @@ DEFAULT_FONT_PATH = Path(r"C:\Windows\Fonts\Pretendard-ExtraBold.ttf")
 FALLBACK_FONT_PATH = Path(r"C:\Windows\Fonts\malgunbd.ttf")
 CANVAS_WIDTH = 1080
 CANVAS_HEIGHT = 1920
-VIDEO_VISIBLE_TOP = 432
+# The existing branded template has a transparent footage window between the
+# header/logo and the lower controls.  Keep that visual language instead of
+# silently replacing it with a bare full-screen render.
+VIDEO_VISIBLE_TOP = 260
 VIDEO_VISIBLE_BOTTOM = 1488
 VIDEO_VISIBLE_HEIGHT = VIDEO_VISIBLE_BOTTOM - VIDEO_VISIBLE_TOP
 FPS = 30
+VIDEO_FILE_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
 DEFAULT_TEMPLATE_IMAGE_CANDIDATES = [
     BASE_DIR / "templates" / "shorts_template.png",
     BASE_DIR / "short_templet.png",
     BASE_DIR / "short_template.png",
 ]
-TITLE_LINE1_BOX = (285, 108, 1050, 205)
-TITLE_LINE2_BOX = (130, 205, 1040, 325)
-CHANNEL_BOX = (0, 1515, 1080, 1610)
+# The channel mark occupies the left side of the template header.  The title
+# belongs beside it, not over the first shot where it hides the visual hook.
+TITLE_LINE1_BOX = (270, 42, 1040, 138)
+TITLE_LINE2_BOX = (270, 135, 1040, 248)
+SOURCE_CREDIT_BOX = (90, 1514, 990, 1605)
 SFX_DIR = BASE_DIR / "필수 효과음 100종"
 SFX_FILE_HINTS = {
     "entrance": ("01-9 띠링", "01-8 뽕", "01-7 띵"),
@@ -39,6 +45,12 @@ SFX_FILE_HINTS = {
     "awkward": ("30 어이없는 상황", "05-3 오리 꽥"),
     "applause": ("03-11 박수+환호", "25-1 응원 소리"),
 }
+COLOR_PALETTES = (
+    {"title1": (255, 80, 118), "title2": (255, 202, 40), "caption": (255, 229, 62), "source": (230, 70, 105)},
+    {"title1": (48, 125, 255), "title2": (132, 72, 255), "caption": (87, 222, 255), "source": (57, 100, 210)},
+    {"title1": (255, 116, 35), "title2": (38, 180, 120), "caption": (255, 148, 65), "source": (220, 90, 26)},
+    {"title1": (214, 55, 179), "title2": (30, 181, 211), "caption": (255, 104, 188), "source": (180, 40, 148)},
+)
 
 
 def configure_stdout() -> None:
@@ -57,6 +69,16 @@ def positive_float(value: object, fallback: float) -> float:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return fallback
+
+
+def palette_for_package(package: dict) -> dict[str, tuple[int, int, int]]:
+    key = str(package.get("short_id") or package.get("candidate_id") or "default")
+    return COLOR_PALETTES[sum(ord(char) for char in key) % len(COLOR_PALETTES)]
+
+
+def ass_bgr_color(rgb: tuple[int, int, int]) -> str:
+    red, green, blue = rgb
+    return f"&H00{blue:02X}{green:02X}{red:02X}"
 
 
 def format_ass_time(seconds: float) -> str:
@@ -109,11 +131,24 @@ def split_display_lines(value: str, max_chars: int) -> list[str]:
     return lines[:2]
 
 
-def compact_line(value: str, max_chars: int) -> str:
+def validated_title_line(value: str, *, field: str, max_visible_chars: int = 18) -> str:
+    """Return a render-safe headline or stop before it is silently damaged.
+
+    A title is editorial content, not disposable UI text. The prior renderer
+    shortened long lines with ``...``; that created broken headlines such as
+    ``노...`` even when the package itself looked valid.
+    """
     text = " ".join(str(value or "").split())
-    if len(text) <= max_chars:
-        return text
-    return text[: max(1, max_chars - 3)].rstrip() + "..."
+    visible_length = len("".join(text.split()))
+    if not text:
+        raise RuntimeError(f"{field} is empty.")
+    if "..." in text or "…" in text:
+        raise RuntimeError(f"{field} contains an ellipsis and must be rewritten, not truncated.")
+    if visible_length > max_visible_chars:
+        raise RuntimeError(
+            f"{field} has {visible_length} visible characters; maximum is {max_visible_chars}. Rewrite the title line."
+        )
+    return text
 
 
 def infer_analysis_dir(package_path: Path) -> Path | None:
@@ -172,10 +207,21 @@ def resolve_template_image() -> Path | None:
 
 
 def prepare_template_layer(output_path: Path) -> Path:
-    template = resolve_template_image()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    template = resolve_template_image()
     if template:
-        image = Image.open(template).convert("RGBA").resize((CANVAS_WIDTH, CANVAS_HEIGHT))
+        with Image.open(template) as source:
+            source = source.convert("RGBA").resize((CANVAS_WIDTH, CANVAS_HEIGHT), Image.Resampling.LANCZOS)
+            # Keep the existing channel mark and player controls, but remove
+            # the empty white block that used to sit between them.  The new
+            # header is intentionally compact so the footage starts high.
+            image = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
+            # Header and footer are template chrome; the footage window between
+            # them must remain transparent so it is never painted white over
+            # the rendered video.
+            ImageDraw.Draw(image).rectangle((0, 0, CANVAS_WIDTH, VIDEO_VISIBLE_TOP), fill=(255, 255, 255, 255))
+            image.alpha_composite(source.crop((0, 0, 270, VIDEO_VISIBLE_TOP)), (0, 0))
+            image.alpha_composite(source.crop((0, VIDEO_VISIBLE_BOTTOM, CANVAS_WIDTH, CANVAS_HEIGHT)), (0, VIDEO_VISIBLE_BOTTOM))
     else:
         image = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
     image.save(output_path)
@@ -241,20 +287,21 @@ def build_text_overlay(package: dict, package_path: Path, output_path: Path, cha
     image = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    title_line1 = compact_line(package.get("title_line1"), 12)
-    title_line2 = compact_line(package.get("title_line2"), 14)
-    channel_text = infer_channel_name(package_path, package, channel_name)
+    title_line1 = validated_title_line(package.get("title_line1"), field="title_line1")
+    title_line2 = validated_title_line(package.get("title_line2"), field="title_line2")
+    channel_name = channel_name.strip() or infer_channel_name(package_path, package)
+    palette = palette_for_package(package)
 
     draw_boxed_text(
         draw,
         title_line1,
         TITLE_LINE1_BOX,
         font_path=font_path,
-        font_size=80,
-        min_font_size=58,
-        fill=(255, 255, 255, 255),
+        font_size=70,
+        min_font_size=46,
+        fill=(*palette["title1"], 255),
         align="left",
-        stroke_width=7,
+        stroke_width=5,
         stroke_fill=(17, 17, 17, 255),
     )
     draw_boxed_text(
@@ -263,31 +310,31 @@ def build_text_overlay(package: dict, package_path: Path, output_path: Path, cha
         TITLE_LINE2_BOX,
         font_path=font_path,
         font_size=82,
-        min_font_size=56,
-        fill=(190, 255, 0, 255),
+        min_font_size=52,
+        fill=(*palette["title2"], 255),
         align="center",
-        stroke_width=10,
+        stroke_width=6,
         stroke_fill=(17, 17, 17, 255),
     )
-    draw_boxed_text(
-        draw,
-        channel_text,
-        CHANNEL_BOX,
-        font_path=font_path,
-        font_size=72,
-        min_font_size=52,
-        fill=(17, 17, 17, 255),
-        align="center",
-        stroke_width=2,
-        stroke_fill=(255, 255, 255, 255),
-    )
-
+    if channel_name:
+        draw_boxed_text(
+            draw,
+            f"출처 | {channel_name}",
+            SOURCE_CREDIT_BOX,
+            font_path=font_path,
+            font_size=48,
+            min_font_size=34,
+            fill=(*palette["source"], 255),
+            align="center",
+            stroke_width=0,
+        )
     image.save(output_path)
     return output_path
 
 
 def build_caption_ass(package: dict, output_path: Path) -> Path:
     font_name = "Pretendard ExtraBold" if DEFAULT_FONT_PATH.exists() else "Malgun Gothic"
+    palette = palette_for_package(package)
     lines = [
         "[Script Info]",
         "ScriptType: v4.00+",
@@ -297,7 +344,7 @@ def build_caption_ass(package: dict, output_path: Path) -> Path:
         "",
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
-        f"Style: Point,{font_name},74,&H00FFFFFF,&H000000FF,&H00101010,&H9A000000,-1,0,0,0,100,100,0,0,1,8,3,2,70,70,760,1",
+        f"Style: Point,{font_name},82,{ass_bgr_color(palette['caption'])},&H000000FF,&H00101010,&H9A000000,-1,0,0,0,100,100,0,0,1,9,3,2,70,70,920,1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
@@ -316,7 +363,16 @@ def build_caption_ass(package: dict, output_path: Path) -> Path:
 
 
 def default_output_path(package_path: Path) -> Path:
-    return package_path.parent.parent.parent / "productions" / f"{package_path.stem}.mp4"
+    analysis_dir = infer_analysis_dir(package_path) or package_path.parent.parent.parent
+    batch_id = ""
+    for parent in package_path.parents:
+        if parent.parent.name == "batches":
+            batch_id = parent.name
+            break
+    output_dir = analysis_dir / "productions"
+    if batch_id:
+        output_dir = output_dir / "batches" / batch_id
+    return output_dir / f"{package_path.stem}.mp4"
 
 
 def resolve_sound_effect(cue: str) -> Path | None:
@@ -361,12 +417,23 @@ def build_filter(clips: list[dict], include_audio: bool, captions_path: Path | N
         end = positive_float(clip.get("source_end"), -1.0)
         if end <= start or start < 0:
             raise RuntimeError(f"Invalid source clip timing at index {index}.")
+        # A landscape talk-show shot cannot safely be centre-cropped into a
+        # vertical frame: a two-person shot turns into a face edge or an arm.
+        # Preserve the full foreground frame and fill the remaining window
+        # with a softened copy of that same shot. This keeps both speakers
+        # visible; a later explicit tracking mode can still choose a tighter
+        # crop only when the edit plan names one person to follow.
+        parts.append(f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,split=2[vbg{index}][vfg{index}]")
         parts.append(
-            f"[0:v]trim=start={start}:end={end},setpts=PTS-STARTPTS,"
-            f"scale={CANVAS_WIDTH}:{VIDEO_VISIBLE_HEIGHT}:force_original_aspect_ratio=increase,"
-            f"crop={CANVAS_WIDTH}:{VIDEO_VISIBLE_HEIGHT},"
-            f"pad={CANVAS_WIDTH}:{CANVAS_HEIGHT}:0:{VIDEO_VISIBLE_TOP}:color=black,"
-            f"setsar=1,fps={FPS}[v{index}]"
+            f"[vbg{index}]scale={CANVAS_WIDTH}:{VIDEO_VISIBLE_HEIGHT}:force_original_aspect_ratio=increase,"
+            f"crop={CANVAS_WIDTH}:{VIDEO_VISIBLE_HEIGHT},gblur=sigma=22,eq=brightness=-0.18:saturation=0.72[bg{index}]"
+        )
+        parts.append(
+            f"[vfg{index}]scale={CANVAS_WIDTH}:{VIDEO_VISIBLE_HEIGHT}:force_original_aspect_ratio=decrease[fg{index}]"
+        )
+        parts.append(
+            f"[bg{index}][fg{index}]overlay=(W-w)/2:(H-h)/2,"
+            f"pad={CANVAS_WIDTH}:{CANVAS_HEIGHT}:0:{VIDEO_VISIBLE_TOP}:color=black,setsar=1,fps={FPS}[v{index}]"
         )
         concat_inputs.append(f"[v{index}]")
         if include_audio:
@@ -417,6 +484,8 @@ def main() -> None:
     package_path = args.package.resolve()
     if not source_video.exists():
         raise FileNotFoundError(f"Source video not found: {source_video}")
+    if source_video.suffix.lower() not in VIDEO_FILE_SUFFIXES:
+        raise RuntimeError(f"Source must be a video file, not {source_video.suffix or 'an extensionless file'}: {source_video}")
     if not package_path.exists():
         raise FileNotFoundError(f"Package JSON not found: {package_path}")
 

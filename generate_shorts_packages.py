@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+import subprocess
 import sys
 import unicodedata
 from typing import Optional
@@ -12,6 +13,7 @@ from typing import Optional
 from openai import OpenAI
 
 from env_loader import format_checked_env_paths, load_project_env
+from usage_ledger import append_chat_usage, summarize_usage, usage_log_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,6 +44,7 @@ BENCHMARK_FINAL_TOP_K = 8
 BENCHMARK_LOCAL_MAX_COMPLETION_TOKENS = 8_000
 GLOBAL_MAX_COMPLETION_TOKENS = 2_400
 PACKAGING_MAX_COMPLETION_TOKENS = 4_800
+TIMELINE_FINAL_CALL_RESERVE_USD = 0.25
 WIDE_WINDOW_GROUP_SIZE = 2
 TARGET_DURATION_MIN = 25.0
 TARGET_DURATION_MAX = 55.0
@@ -177,6 +180,45 @@ def build_parser() -> argparse.ArgumentParser:
         "--no-wide-windows",
         action="store_true",
         help="Disable adjacent transcript windows used to find non-contiguous montage shorts.",
+    )
+    parser.add_argument(
+        "--timeline-first",
+        action="store_true",
+        help="Build local candidates from the reusable visual+dialogue timeline instead of repeatedly asking a model to rediscover them.",
+    )
+    parser.add_argument(
+        "--final-candidate-limit",
+        type=int,
+        default=5,
+        help="Maximum locally ranked candidates sent to the final editorial model in timeline-first mode.",
+    )
+    parser.add_argument(
+        "--package-budget-usd",
+        type=float,
+        default=0.0,
+        help="Maximum estimated spend for final package-generation calls in timeline-first mode.",
+    )
+    parser.add_argument(
+        "--no-candidate-visual-refinement",
+        action="store_true",
+        help="Skip the selected-candidate visual fact check. Intended only for diagnostics, not production.",
+    )
+    parser.add_argument(
+        "--visual-refinement-model",
+        default="gpt-5.4",
+        help="Vision model used once per selected candidate to verify its actual planned cuts.",
+    )
+    parser.add_argument(
+        "--visual-refinement-frames-per-clip",
+        type=int,
+        default=2,
+        help="Dense source frames sampled inside each selected candidate cut.",
+    )
+    parser.add_argument(
+        "--visual-refinement-candidate-limit",
+        type=int,
+        default=10,
+        help="Maximum local candidates visually checked to replace rejected top candidates before final packaging.",
     )
     parser.add_argument("--force", action="store_true")
     return parser
@@ -388,19 +430,24 @@ Return JSON only.
 PACKAGING_SYSTEM = """You package one Korean short for CapCut rough-cut generation.
 
 Rules:
-- title must be exactly 2 lines
+- on_video_title must be one short, complete on-screen headline. It is displayed as one line, never as a fixed two-line banner.
 - Title is a human editor's mini-headline, not two generic keyword labels. It must identify a person/role, the concrete event, and what changed or was revealed.
 - Write it like a natural Korean entertainment headline that a person would type after actually watching the scene. A complete phrase or compact sentence is welcome; do not force two choppy noun fragments.
 - Good abstract shapes: "[인물]의 [구체적 행동]을 / [결과·반응]한 [상대]", "더 [행동]할수록 / 더 [잃게 된] [인물]", "[인물]이 [대상]을 / 지키려고 택한 방법". These are shapes only: invent wording from the current scene and never reuse names or facts not proven by it.
 - title should feel clickable, specific, and stop-scroll friendly, but never read like a vague slogan, a calm synopsis, or a report label.
 - surface the person/role, trigger, and reaction/reversal/payoff fast whenever the footage proves them.
 - for Korean celebrity YouTube/talk sources, write titles like a high-performing entertainment short: conversational and punchy when the beat is clearly comic.
-- Split one coherent headline naturally across two lines; line 1 and line 2 should read as one sentence when joined, not as two unrelated slogans.
+- First write on_video_title as one complete, natural Korean entertainment headline with no line break. This is the source of truth for the on-video title.
+- Keep it concise enough to read in one glance: normally 8 to 24 visible Korean characters excluding spaces. For a clearly comic or excessive beat, a natural comment-style phrase such as "얼마나 [행동]한지 감도 안 옴 ㅋㅋ" is welcome only when the footage proves it.
+- For backward-compatible JSON, title_line1 must equal on_video_title exactly and title_line2 must be an empty string. Never split the title into two lines.
+- title_highlight must be one short, meaningful word or phrase copied exactly from on_video_title (normally 2 to 8 visible characters). It is the only part rendered in yellow; choose the punchline, object, reaction, or meme phrase, never a random first word.
+- Before returning the title, read on_video_title as a standalone Korean sentence. It must make grammatical sense and plainly answer who did what and why the viewer should care. Rewrite any headline that sounds like a literal machine summary, has an unclear subject/object, or makes a dramatic claim the footage does not directly prove.
+- Never use an unsupported ending claim such as "마지막엔", "결국", "비자", "인생", or "최종" merely to make the title bigger. If the precise outcome is not visibly or audibly proven in the selected clips, state the directly proven reaction instead.
 - A title line may contain 4 to 18 visible Korean characters excluding spaces.
 - Emoji is optional, not decoration. Default to no emoji; if the exact scene genuinely benefits from it, use at most one across both lines and never repeat one fixed emoji across shorts.
 - do not copy reference titles, names, motifs, or wording; infer them from the current transcript
 - if comment evidence exists, use it to sharpen the title, hook_line, selection_pitch, or point captions without quoting viewers directly
-- narration should be omitted unless needed
+- narration is a deliberate editing device, never filler. Follow the task-specific narration requirement exactly.
 - maximum 2 narration lines
 - maximum 3 point captions
 - the short must be reconstructable into at least 5 cuts
@@ -478,6 +525,7 @@ def model_json(
     if max_completion_tokens is not None:
         request_kwargs["max_completion_tokens"] = max_completion_tokens
     response = client.chat.completions.create(**request_kwargs)
+    append_chat_usage(stage="package_generation", model=model, response=response)
     return parse_json_response(response.choices[0].message.content or "{}")
 
 
@@ -853,8 +901,9 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         "short_id",
         "core_event",
         "emotion_arc",
+        "on_video_title",
         "title_line1",
-        "title_line2",
+        "title_highlight",
         "upload_title",
         "selection_pitch",
         "hook_line",
@@ -929,16 +978,26 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
             "do not package one long continuous scene."
         )
 
+    on_video_title = " ".join(str(result.get("on_video_title") or "").split())
+    title_line1 = " ".join(str(result.get("title_line1") or "").split())
+    title_line2 = " ".join(str(result.get("title_line2") or "").split())
+    if on_video_title != title_line1 or title_line2:
+        return False, (
+            "on_video_title must be the one-line display title: title_line1 must equal it exactly and "
+            "title_line2 must be empty."
+        )
+    visible_title_length = len("".join(on_video_title.split()))
+    if not 8 <= visible_title_length <= 24:
+        return False, "on_video_title must be a concise one-line headline of 8 to 24 visible characters."
+    title_highlight = " ".join(str(result.get("title_highlight") or "").split())
+    highlight_length = len("".join(title_highlight.split()))
+    if title_highlight not in on_video_title or not 2 <= highlight_length <= 8:
+        return False, "title_highlight must be a 2 to 8 character phrase copied exactly from on_video_title."
     title_text = " ".join(
-        str(result.get(key) or "") for key in ("title_line1", "title_line2", "upload_title")
+        str(result.get(key) or "") for key in ("on_video_title", "upload_title")
     )
-    for field in ("title_line1", "title_line2"):
-        line = " ".join(str(result.get(field) or "").split())
-        visible_length = len("".join(line.split()))
-        if "..." in line or "…" in line:
-            return False, f"{field} contains an ellipsis; rewrite it as a complete headline."
-        if not 4 <= visible_length <= 18:
-            return False, f"{field} must contain 4 to 18 visible characters; it has {visible_length}."
+    if "..." in on_video_title or "…" in on_video_title:
+        return False, "on_video_title contains an ellipsis; rewrite it as a complete headline."
     title_emoji_count = sum(
         1
         for char in f"{result.get('title_line1') or ''}{result.get('title_line2') or ''}"
@@ -946,9 +1005,21 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
     )
     if title_emoji_count > 1:
         return False, "Use at most one emoji across the full two-line title; never add a fixed decorative emoji."
+    upload_title = str(result.get("upload_title") or "")
+    if any(0x1F000 <= ord(char) <= 0x1FAFF or 0x2600 <= ord(char) <= 0x27BF for char in upload_title):
+        return False, "upload_title must not contain emoji."
     generic_title_shapes = ("폭발한 순간", "폭발 현장", "감탄 폭발", "웃음 폭발")
     if any(shape in title_text for shape in generic_title_shapes):
         return False, "Title uses a generic explosion phrase; name the concrete trigger and payoff instead."
+    generic_title_phrases = ("한마디 뒤", "출연자들이", "약속받았다", "말이 오간")
+    if any(phrase in title_text for phrase in generic_title_phrases):
+        return False, "Title uses generic passive narration; name the concrete person, food/object, line, or reaction instead."
+    unsupported_title_shapes = ("마지막엔", "비자를 빈다")
+    if any(shape in title_text for shape in unsupported_title_shapes):
+        return False, (
+            "Title uses an unsupported, machine-like conclusion phrase; write only the concrete action and reaction "
+            "proven by the selected clips."
+        )
 
     raw_narration = result.get("narration", [])
     if not isinstance(raw_narration, list):
@@ -1033,7 +1104,7 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
     primary_variable = str(experiment.get("primary_variable") or "").strip()
     success_signal = str(experiment.get("success_signal") or "").strip()
     choices = experiment.get("choices")
-    allowed_variables = {"hook_order", "cut_rhythm", "caption_emphasis", "sound_effect", "visual_reframe", "reaction_payoff"}
+    allowed_variables = {"hook_order", "cut_rhythm", "caption_emphasis", "sound_effect", "visual_reframe", "reaction_payoff", "narration"}
     if not hypothesis or primary_variable not in allowed_variables or not success_signal:
         return False, "experiment requires hypothesis, valid primary_variable, and success_signal."
     if not isinstance(choices, list) or not 2 <= len(choices) <= 4:
@@ -1102,10 +1173,11 @@ def model_json_validated(
     validator,
     temperature: float = DEFAULT_TEMPERATURE,
     max_completion_tokens: int | None = None,
+    max_retries: int = MAX_RETRIES,
 ) -> dict:
     prompt = user_prompt
     last_error = ""
-    for _ in range(MAX_RETRIES):
+    for _ in range(max(1, max_retries)):
         try:
             result = model_json(
                 client,
@@ -1137,7 +1209,7 @@ def model_json_validated(
             + "Do not fake this by splitting one continuous exchange: explicitly arrange a later hook, earlier context, escalation/proof, reaction, and payoff from distinct source moments. "
             + "Return the full corrected source_clips list, not only the changed item."
         )
-    raise RuntimeError(f"Model output failed validation after {MAX_RETRIES} tries: {last_error}")
+    raise RuntimeError(f"Model output failed validation after {max(1, max_retries)} tries: {last_error}")
 
 
 def normalize_text(text: str) -> str:
@@ -2011,6 +2083,11 @@ def normalize_genre_scorecard(value: object) -> tuple[dict | None, str]:
         except Exception:
             return None, f"genre_scorecard {penalty_id} deduction must be an integer."
         max_deduction = int(penalties_by_id[penalty_id].get("max_deduction", 0) or 0)
+        # A listed zero is the model's way of saying this risk is absent.  It
+        # carries no score effect, so remove it rather than rejecting an
+        # otherwise evidence-based candidate and aborting the whole run.
+        if deduction == 0:
+            continue
         if not 1 <= deduction <= max_deduction:
             return None, f"genre_scorecard {penalty_id} deduction must be 1 to {max_deduction}."
         reason = str(item.get("reason", "")).strip()
@@ -2351,6 +2428,378 @@ def load_merged_segments() -> list[dict]:
     return clean_segments(data["segments"])
 
 
+def transcript_window(segments: list[dict], start_sec: float, end_sec: float) -> list[dict]:
+    """Return the exact dialogue evidence attached to a visual timeline beat."""
+    return [
+        segment
+        for segment in segments
+        if float(segment.get("end", 0.0)) >= start_sec and float(segment.get("start", 0.0)) <= end_sec
+    ]
+
+
+def short_text(value: object, limit: int = 180) -> str:
+    value = " ".join(str(value or "").split())
+    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+def write_timeline_screenplay(merged_segments: list[dict]) -> list[dict]:
+    """Create the one reusable, cross-modal source of truth for an edit run.
+
+    Unlike the previous local-candidate loop, this never asks a model to read
+    the same ten-minute transcript window again.  Each card binds verified
+    visual evidence to the dialogue that occurred during the same time range.
+    """
+    cards: list[dict] = []
+    for event in VISUAL_EVENTS:
+        try:
+            start = round(float(event.get("start_sec")), 3)
+            end = round(float(event.get("end_sec")), 3)
+        except (TypeError, ValueError):
+            continue
+        if end <= start:
+            continue
+        dialogue = transcript_window(merged_segments, start, end)
+        raw_shortability = event.get("visual_shortability_score")
+        if raw_shortability is None:
+            # Existing event scripts predate the explicit score.  Preserve
+            # their usable action/reaction evidence while new runs populate a
+            # model-scored value.
+            fallback_score = 7 if str(event.get("confidence") or "").lower() == "high" else 6
+        else:
+            try:
+                fallback_score = max(0, min(10, int(raw_shortability)))
+            except (TypeError, ValueError):
+                fallback_score = 0
+            if fallback_score == 0 and str(event.get("action") or "").strip() and str(event.get("visual_hook") or "").strip():
+                fallback_score = 7 if str(event.get("confidence") or "").lower() == "high" else 6
+        cards.append(
+            {
+                "scene_id": str(event.get("event_id") or f"scene_{len(cards) + 1:03d}"),
+                "start_sec": start,
+                "end_sec": end,
+                "dialogue": dialogue,
+                "dialogue_text": short_text(" ".join(str(item.get("text") or "") for item in dialogue), 500),
+                "visible_setup": short_text(event.get("visible_setup"), 360),
+                "action": short_text(event.get("action"), 360),
+                "reaction": short_text(event.get("reaction"), 300),
+                "payoff": short_text(event.get("payoff"), 300),
+                "visual_hook": short_text(event.get("visual_hook"), 200),
+                "characters": [str(value) for value in event.get("characters", []) or [] if str(value).strip()],
+                "frame_timestamps": event.get("frame_timestamps", []) or [],
+                "confidence": str(event.get("confidence") or "low"),
+                "visual_shortability_score": fallback_score,
+                "editorial_role": str(event.get("editorial_role") or "unusable"),
+            }
+        )
+    payload = {
+        "version": 1,
+        "source_title": SOURCE_TITLE,
+        "description": "시간·대사·검증된 화면 행동을 연결한 재사용 가능한 영화 대본형 타임라인",
+        "cards": cards,
+    }
+    save_json(OUTPUT_DIR / "timeline" / "timeline_screenplay.json", payload)
+    return cards
+
+
+def clip_from_dialogue(segment: dict, purpose: str, source_end: float) -> dict:
+    start = max(0.0, float(segment.get("start", 0.0)))
+    segment_end = float(segment.get("end", start + 1.8))
+    usable_end = max(start + MIN_CLIP_DURATION_SEC, segment_end, float(source_end))
+    end = max(start + MIN_CLIP_DURATION_SEC, segment_end)
+    # ASR lines can be long.  A candidate blueprint must give the editor a
+    # concise beat, not a continuous transcript paragraph.
+    end = min(end, start + 3.6, usable_end)
+    if end <= start:
+        end = min(usable_end, start + 1.0)
+    return {"source_start": round(start, 3), "source_end": round(end, 3), "purpose": purpose}
+
+
+def nearest_unused_dialogue(
+    segments: list[dict],
+    target: float,
+    used_starts: set[float],
+) -> dict | None:
+    ranked = sorted(segments, key=lambda item: abs(float(item.get("start", 0.0)) - target))
+    for segment in ranked:
+        start = round(float(segment.get("start", 0.0)), 3)
+        end = float(segment.get("end", 0.0))
+        if not str(segment.get("text") or "").strip() or end - start < 0.25:
+            continue
+        if any(abs(start - previous) < 0.7 for previous in used_starts):
+            continue
+        used_starts.add(start)
+        return segment
+    return None
+
+
+def visual_signal_score(card: dict) -> int:
+    text = " ".join(
+        str(card.get(key) or "") for key in ("action", "reaction", "payoff", "visual_hook", "dialogue_text")
+    )
+    score = 55 + int(card.get("visual_shortability_score") or 0) * 3
+    if str(card.get("confidence") or "").lower() == "high":
+        score += 8
+    if str(card.get("reaction") or "").strip() and "명확" not in str(card.get("reaction") or ""):
+        score += 8
+    if str(card.get("action") or "").strip():
+        score += 6
+    if str(card.get("payoff") or "").strip():
+        score += 6
+    if any(token in text for token in ("웃", "놀", "울", "반응", "고백", "못", "처음", "갑자기", "진짜")):
+        score += 5
+    return max(60, min(95, score))
+
+
+def build_timeline_candidates(merged_segments: list[dict]) -> list[dict]:
+    """Build candidate edit skeletons locally from screenplay cards.
+
+    Dialogue proposes the words, but every candidate starts from a verified
+    visual card and carries the cards that prove its action/reaction.  This
+    removes the nine repeated model-based transcript discovery calls.
+    """
+    cards = write_timeline_screenplay(merged_segments)
+    candidates: list[dict] = []
+    seen_anchor_times: list[float] = []
+    for index, card in enumerate(cards):
+        action_text = " ".join(str(card.get(key) or "") for key in ("action", "reaction", "payoff", "visual_hook"))
+        if not str(card.get("visual_hook") or "").strip() or not str(card.get("action") or "").strip():
+            continue
+        if str(card.get("confidence") or "").lower() == "low" or int(card.get("visual_shortability_score") or 0) < 5:
+            continue
+        anchor = (float(card["start_sec"]) + float(card["end_sec"])) / 2
+        if any(abs(anchor - previous) < 45.0 for previous in seen_anchor_times):
+            continue
+        # A candidate must close inside the event that earned its score.
+        # The old three-card neighbourhood often appended the next unrelated
+        # conversation after a real cooking/result/payoff beat, which made the
+        # final cut look like an unfinished story during visual verification.
+        neighborhood = [card]
+        window_start = float(card["start_sec"])
+        window_end = float(card["end_sec"])
+        dialogue = transcript_window(merged_segments, window_start, window_end)
+        if len(dialogue) < MIN_CLIP_COUNT:
+            continue
+        used_starts: set[float] = set()
+        targets = [
+            anchor,
+            window_start + (window_end - window_start) * 0.12,
+            window_start + (window_end - window_start) * 0.35,
+            window_start + (window_end - window_start) * 0.60,
+            window_start + (window_end - window_start) * 0.80,
+            window_end - 0.8,
+        ]
+        purposes = ["hook", "context", "bridge", "reaction", "reveal", "payoff"]
+        clips = []
+        for target, purpose in zip(targets, purposes):
+            segment = nearest_unused_dialogue(dialogue, target, used_starts)
+            if segment:
+                clips.append(clip_from_dialogue(segment, purpose, window_end))
+        if len(clips) < MIN_CLIP_COUNT:
+            continue
+        clips[-1]["purpose"] = "payoff"
+        visible_evidence = [
+            {
+                "scene_id": item["scene_id"],
+                "start_sec": item["start_sec"],
+                "end_sec": item["end_sec"],
+                "action": item["action"],
+                "reaction": item["reaction"],
+                "payoff": item["payoff"],
+            }
+            for item in neighborhood
+        ]
+        candidate_id = f"timeline_{len(candidates) + 1:03d}"
+        candidates.append(
+            {
+                "candidate_id": candidate_id,
+                "chunk_id": "timeline_screenplay",
+                "score": visual_signal_score(card),
+                "hook_frame_name": card["visual_hook"],
+                "hook_frame_reason": f"{card['action']} / {card['reaction']}",
+                "viewer_promise": short_text(card.get("payoff") or card.get("reaction") or card.get("action"), 180),
+                "core_event": short_text(action_text, 300),
+                "why_it_works": "대사와 화면 행동·반응이 같은 타임라인 카드에서 확인되는 장면이다.",
+                "emotion_arc": short_text(f"{card.get('action')} → {card.get('reaction')} → {card.get('payoff')}", 220),
+                "thread_key": short_text(card.get("visual_hook") or card.get("context"), 120),
+                "thread_intention": short_text(card.get("payoff") or card.get("reaction"), 180),
+                "candidate_start": round(window_start, 3),
+                "candidate_end": round(window_end, 3),
+                "hook_moment": {"time": clips[0]["source_start"], "reason": card["visual_hook"]},
+                "payoff_moment": {"time": clips[-1]["source_start"], "reason": short_text(card.get("payoff") or card.get("reaction"), 120)},
+                "narration_need": "low",
+                "clip_blueprint": clips,
+                "title_angle": short_text(card.get("visual_hook") or card.get("action"), 120),
+                "timeline_answerability": "high",
+                "fragment_risk": "low",
+                "visible_evidence": visible_evidence,
+            }
+        )
+        seen_anchor_times.append(anchor)
+    candidates.sort(key=lambda item: (int(item["score"]), -float(item["candidate_start"])), reverse=True)
+    return candidates
+
+
+def select_timeline_candidates(candidates: list[dict], limit: int) -> list[dict]:
+    # Many visual cards receive the same coarse score.  Taking the first N
+    # would then inspect only the opening minutes of a 40+ minute longform.
+    # Seed the shortlist with the strongest candidate from distinct time bands
+    # before filling remaining places globally.
+    ranked = sorted(
+        candidates,
+        key=lambda item: (int(item.get("score") or 0), -float(item.get("candidate_start") or 0)),
+        reverse=True,
+    )
+    bucket_seconds = 180.0
+    bucket_best: dict[int, dict] = {}
+    for candidate in ranked:
+        bucket = int(max(0.0, float(candidate.get("candidate_start") or 0)) // bucket_seconds)
+        bucket_best.setdefault(bucket, candidate)
+    diversified = sorted(
+        bucket_best.values(),
+        key=lambda item: (int(item.get("score") or 0), -float(item.get("candidate_start") or 0)),
+        reverse=True,
+    )
+    ordered_pool = diversified + [
+        candidate for candidate in ranked if candidate.get("candidate_id") not in {item.get("candidate_id") for item in diversified}
+    ]
+    selected = []
+    for candidate in ordered_pool:
+        if len(selected) >= max(1, limit):
+            break
+        selected.append(
+            {
+                "candidate_id": candidate["candidate_id"],
+                "global_rank": len(selected) + 1,
+                "global_score": int(candidate["score"]),
+                "selection_reason": "검증된 화면 행동·반응과 같은 시간대의 대사가 모두 있는 타임라인 카드 기반 후보입니다.",
+                "duplicate_group": str(candidate.get("thread_key") or candidate["candidate_id"]),
+            }
+        )
+    return selected
+
+
+def refine_timeline_selected_candidates(
+    local_candidates: list[dict],
+    selected: list[dict],
+    *,
+    model: str,
+    frames_per_clip: int,
+    force: bool,
+) -> list[dict]:
+    """Fact-check the actual selected cut skeletons before final editorial work.
+
+    The broad visual-event script has a deliberately wide cadence.  This
+    narrow pass inspects two frames inside every planned cut, so a headline
+    cannot be based only on a twelve-second representative frame or transcript
+    guess.  It runs only for the already bounded final candidate set.
+    """
+    visual_script_path = ANALYSIS_DIR / "visual_events" / "visual_event_script.json"
+    try:
+        visual_script = json.loads(visual_script_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Candidate visual refinement requires visual_event_script.json.") from exc
+    source_video_value = str(visual_script.get("source_video") or "").strip()
+    source_video = Path(source_video_value)
+    if not source_video_value or not source_video.exists():
+        raise RuntimeError("Candidate visual refinement requires the downloaded source video used for visual analysis.")
+
+    local_path = OUTPUT_DIR / "local" / "all_candidates.json"
+    selected_path = OUTPUT_DIR / "global" / "selected_candidates.json"
+    evidence_path = OUTPUT_DIR / "timeline" / "candidate_visual_evidence.json"
+    command = [
+        sys.executable,
+        "-u",
+        str(BASE_DIR / "refine_candidate_visuals.py"),
+        "--source-video",
+        str(source_video),
+        "--analysis-dir",
+        str(ANALYSIS_DIR),
+        "--candidates-json",
+        str(local_path),
+        "--selected-json",
+        str(selected_path),
+        "--output",
+        str(evidence_path),
+        "--model",
+        model,
+        "--frames-per-clip",
+        str(max(1, min(3, int(frames_per_clip)))),
+    ]
+    if force:
+        command.append("--force")
+    completed = subprocess.run(
+        command,
+        cwd=BASE_DIR,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if completed.returncode != 0 or not evidence_path.exists():
+        detail = completed.stderr.strip() or completed.stdout.strip() or "no evidence output"
+        raise RuntimeError(f"Candidate visual refinement failed: {detail}")
+    try:
+        evidence_payload = json.loads(evidence_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Candidate visual refinement produced unreadable JSON.") from exc
+    evidence_by_id = {
+        str(item.get("candidate_id")): item
+        for item in evidence_payload.get("candidates", [])
+        if isinstance(item, dict) and item.get("candidate_id")
+    }
+    candidates_by_id = {str(item.get("candidate_id")): item for item in local_candidates if isinstance(item, dict)}
+    approved: list[dict] = []
+    rejected: list[dict] = []
+    for item in sorted(selected, key=lambda value: int(value.get("global_rank", 999))):
+        candidate_id = str(item.get("candidate_id") or "")
+        evidence = evidence_by_id.get(candidate_id, {})
+        candidate = candidates_by_id.get(candidate_id)
+        if candidate is not None:
+            candidate["candidate_visual_evidence"] = evidence
+        if evidence.get("verdict") != "ready":
+            rejected.append(
+                {
+                    "candidate_id": candidate_id,
+                    "global_rank": item.get("global_rank"),
+                    "reason": evidence.get("rejection_reason") or "visual evidence did not pass",
+                }
+            )
+            print(
+                f"[package] candidate_visual_rejected -> {candidate_id}: {rejected[-1]['reason']}",
+                flush=True,
+            )
+            continue
+        checked = dict(item)
+        checked["global_rank"] = len(approved) + 1
+        checked["selection_reason"] = (
+            str(checked.get("selection_reason") or "")
+            + " / 실제 예정 컷 화면 검증 통과"
+        ).strip(" /")
+        approved.append(checked)
+    save_json(OUTPUT_DIR / "timeline" / "candidate_visual_rejections.json", {"rejected": rejected})
+    if not approved:
+        raise RuntimeError("All selected candidates failed dense visual verification; no unsupported package was created.")
+    print(
+        f"[package] candidate_visual_refinement ready={len(approved)}/{len(selected)} model={model}",
+        flush=True,
+    )
+    return approved
+
+
+def package_budget_exhausted(max_estimated_usd: float) -> bool:
+    if max_estimated_usd <= 0:
+        return False
+    path = usage_log_path()
+    if not path or not path.exists():
+        return False
+    summary = summarize_usage(path)
+    current = float(summary.get("by_stage", {}).get("package_generation", {}).get("estimated_usd", 0.0) or 0.0)
+    # Reserve enough for a worst-case bounded final response before dispatching
+    # another request.  The output floor is protected by reserving this money
+    # before exploration, rather than stopping after it has been spent.
+    return current + TIMELINE_FINAL_CALL_RESERVE_USD > max_estimated_usd
+
+
 def extract_window(segments: list[dict], start_sec: float, end_sec: float, pad_sec: float = 20.0) -> list[dict]:
     window_start = max(0.0, start_sec - pad_sec)
     window_end = end_sec + pad_sec
@@ -2681,6 +3130,19 @@ def build_packaging_prompt(
     short_id = f"short_{rank:02d}"
     blueprint = candidate.get("clip_blueprint", []) or []
     blueprint_total = total_clip_duration_sec(blueprint)
+    visual_confirmation = candidate.get("candidate_visual_evidence") if isinstance(candidate.get("candidate_visual_evidence"), dict) else {}
+    visual_confirmation_context = (
+        "Selected-cut visual confirmation (hard evidence; do not write beyond it):\n"
+        + json.dumps(visual_confirmation, ensure_ascii=False, indent=2)
+        if visual_confirmation
+        else "Selected-cut visual confirmation: unavailable. Use only the broad visual event script and transcript."
+    )
+    narration_requirement = (
+        "- This is the mandatory narration test package. Include exactly one narration item and set experiment.primary_variable to narration. "
+        "Use one 8 to 24 character Korean editor line near the hook or a transition; it must add irony, context, or a question rather than repeat the source dialogue."
+        if rank == 1
+        else "- Narration is optional for this package. Use it only when it adds a genuinely new editor perspective."
+    )
     return f"""Source title: {SOURCE_TITLE}
 {format_movie_info_for_prompt()}
 {format_youtube_context_for_prompt(candidate.get('candidate_start'), candidate.get('candidate_end'))}
@@ -2694,6 +3156,8 @@ Target short id: {short_id}
 Candidate summary:
 {json.dumps(candidate, ensure_ascii=False, indent=2)}
 
+{visual_confirmation_context}
+
 Candidate clip blueprint (starting skeleton, in playback order):
 {format_clip_plan_for_prompt(blueprint)}
 
@@ -2704,6 +3168,7 @@ Task:
 {repair_note}
 - When an Active orchestration learning rule is present, preserve its required change in the final source_clips. Do not silently revert to the previous default edit structure.
 - When verified visual events are supplied, title and cut only what those events or the transcript can prove. A visual reaction, prop, expression, or action may be used only when it is listed in the event script near the chosen timestamps.
+- When selected-cut visual confirmation is supplied, its grounded_title_facts, safe_hook, safe_payoff, and per-cut evidence are stricter than the broad event script. Do not use a subject, action, motive, reaction, or conclusion outside those facts.
 - If this package is driven by audience comments about a visual subject, make that subject visible in the title, hook, and clip purposes.
 - The final short must run longer than {MINIMUM_FINAL_DURATION_EXCLUSIVE_SEC:.0f} seconds. It should usually run {TARGET_DURATION_MIN:.0f} to {TARGET_DURATION_MAX:.0f} seconds; let a clear story run longer when needed, but never pad it.
 - It must be reconstructable into at least {MIN_CLIP_COUNT} cuts.
@@ -2741,21 +3206,25 @@ Task:
 - Reject a candidate when its payoff is only a facial reaction, ordinary driving/room footage, or a vague mood without a concrete triggering line or action.
 - for non-contiguous montage packages, any evidence clip longer than 8 seconds should be split unless it contains one uninterrupted trigger/reaction exchange
 - do not pad with long unbroken context if a tighter reaction or bridge cut would work
-- title must be exactly 2 lines in Korean
-- title_line1 and title_line2 should each contain 4 to 18 visible characters excluding spaces; allow short English tokens when they appear in the source
-- Write the two lines as one coherent, human-written entertainment headline. The joined lines may form a compact complete sentence; do not reduce it to two stiff keyword fragments or a report label.
-- line 1 should usually identify the person/trigger/action; line 2 should complete its reaction, consequence, reversal, or motive.
+- title must be exactly one concise Korean line; do not insert a line break.
+- Keep the on-video title between 8 and 24 visible characters. It must name one concrete person/role, food/object, line, or reaction—not generic passive narration such as "출연자들이", "한마디 뒤", or "약속받았다".
+- title_line1 must equal on_video_title exactly and title_line2 must be an empty string. This is a compatibility field, not a second display line.
+- title_highlight must be a 2 to 8 character phrase copied exactly from on_video_title. It is the one punchline, object, reaction, or meme phrase rendered in yellow.
+- Write the one line as a coherent, human-written entertainment headline. It may be a witty comment-style meme phrase when the scene proves it; do not reduce it to a stiff keyword fragment or report label.
+- Run a final naturalness check on the one-line title: a Korean viewer must immediately understand the subject, action, or irresistible reaction without guessing missing context. If it feels like a translated synopsis or an exaggerated conclusion, rewrite it with only the event directly shown by the selected clips.
+- Do not use unsupported conclusion bait such as "마지막엔", "결국", "비자", "인생", or "최종" unless that exact consequence is directly proven by the selected footage and dialogue.
+- the one line should surface the most watchable trigger, reaction, reversal, or payoff without trying to summarize every beat.
 - avoid generic title filler such as "현장", "대공개", "포착", "이유는?", "진심", "모습", and "순간"
-- avoid ellipsis and do not end either title line with "..."
+- avoid ellipsis and do not end the title with "..."
 - title should feel like a high-performing short headline, not a neutral recap
 - title should surface trigger, person/role, reaction, or payoff fast
 - Do not use generic phrases such as "폭발한 순간", "폭발 현장", "감탄 폭발", or "웃음 폭발". State the unusual line, choice, accusation, mistake, or result that actually happens on screen.
-- for Korean celebrity YouTube/talk, line 1 should name the trigger, person, object, or situation; line 2 should name the reaction, reversal, or payoff
+- for Korean celebrity YouTube/talk, the one line should name the trigger, person, object, situation, reaction, reversal, or payoff that is most watchable.
 - do not reuse titles or motifs from reference shorts unless the current source independently contains them
 - do not use fixed title templates; title wording must come from the current source
-- Emoji is optional. Use zero by default; never prepend the same decorative emoji to every title. When one is genuinely meaningful, use no more than one across both title lines.
+- Emoji is optional. Use zero by default; never prepend the same decorative emoji to every title. When one is genuinely meaningful, use no more than one in the title.
 - for a strong comic, excessive, confused, or unexpected beat, use at most one current Korean comment-style meme phrase in either a title line, upload_title, or point caption. Good shapes include "얼마나 [행동]한지 감도 안 옴 ㅋㅋㅋ", "이게 맞아?ㅋㅋ", or "갑자기 분위기 [반전]". Use one only when the visible scene proves it; never force a meme into a serious, emotional, or neutral scene.
-- upload_title is the actual YouTube upload title, separate from the two-line on-video title. It must be a human-written Korean entertainment headline, not a mechanical concatenation of title_line1 + title_line2.
+- upload_title is the actual YouTube upload title, separate from the one-line on-video title. It must be a human-written Korean entertainment headline, not a mechanical duplication of the on-video title.
 - Write upload_title as one natural, specific sentence/phrase (normally 18 to 55 visible Korean characters): name the person or role, concrete action/event, and surprising reaction, consequence, motive, or reversal. It may use different wording from the on-video title.
 - Good abstract upload-title shapes: "[구체적 장면]을 [행동]한 [인물]의 변명", "더 [행동]할수록 더 [결과]가 된 [인물]", "[인물]이 [대상]을 지키려고 택한 방법". These are only human-writing shapes; never fabricate facts, names, relationships, or motives beyond the current footage.
 - Do not use a default emoji, repetitive suffix, generic "이유", or bare keyword list. A single "ㅋㅋ" is allowed only where the visible payoff is genuinely comic; otherwise omit it. Do not add hashtags here; hashtags are handled separately.
@@ -2768,7 +3237,9 @@ Task:
 - main_characters must be 1 to 3 role labels or names
 - protagonist_presence must be one of high, medium, low, unknown
 - standalone_clarity must be one of high, medium, low
-- narration should be omitted unless needed
+- {narration_requirement.lstrip('- ')}
+- Narration is an optional test variable. When used, write exactly one short Korean editor line (normally 8 to 24 characters) that adds context, irony, or a question the source dialogue alone does not make instantly clear. It must not paraphrase dialogue or narrate the obvious.
+- For the first package selected for a narration experiment, include exactly one narration item and set experiment.primary_variable to narration. Keep it near the hook or a transition, never on the final reaction.
 - point_captions must contain 0 to 3 items; keep only the strongest caption beats
 - point caption times must be relative to the short timeline
 - write point captions like a real Korean variety-show editor, not an AI summary: short, spoken, playful, and specific to the visible beat
@@ -2780,11 +3251,11 @@ Task:
 - For an entertainment package that passes as auto_render, include exactly one sound effect when the verified visual event script or the selected clips contain a clear entrance, reveal, surprise, impact, correct/wrong answer, awkward silence, or applause payoff. Use zero only when none of those moments is actually present; do not invent a cue merely to meet a quota.
 - sound_effects may contain 0 to {MAX_SOUND_EFFECTS} cues. Use them sparingly: only for a visible entrance, transition, surprise, impact, correct/wrong answer, awkward silence, or applause payoff.
 - choose cue from: {", ".join(sorted(SOUND_EFFECT_CUES))}. Place it exactly on the related beat, keep volume around 0.18 to 0.32, and never use an effect where it would cover dialogue or feel forced.
-- experiment is mandatory. Choose exactly one primary_variable from hook_order, cut_rhythm, caption_emphasis, sound_effect, visual_reframe, reaction_payoff. State a testable Korean hypothesis, 2 to 4 actual choices in this package, and a success signal. If no sound effect is used, do not claim one.
+- experiment is mandatory. Choose exactly one primary_variable from hook_order, cut_rhythm, caption_emphasis, sound_effect, visual_reframe, reaction_payoff, narration. State a testable Korean hypothesis, 2 to 4 actual choices in this package, and a success signal. If no sound effect is used, do not claim one.
 - narration target_start must also be relative to the short timeline
 - use natural Korean suitable for the source type; for YouTube variety/talk, prefer casual entertainment phrasing over movie recap phrasing
 - avoid bland generic phrasing
-- do not repeat the exact meaning of the 2-line title inside point captions
+- do not repeat the exact meaning of the one-line title inside point captions
 - help the user choose this short before making a CapCut draft
 - prefer ending on reaction rather than explanation when possible
 - when a Genre benchmark profile is present, independently score the final source_clips with every configured dimension and include a genre_scorecard; set score to its dimension total minus deductions
@@ -2804,6 +3275,7 @@ Return JSON with this exact shape:
   }},
   "core_event": "한 문장 요약",
   "emotion_arc": "감정 흐름",
+  "on_video_title": "상단 표시용 완전한 한 문장",
   "title_line1": "제목 1줄",
   "title_line2": "제목 2줄",
   "upload_title": "업로드용 제목 한 줄",
@@ -2891,6 +3363,7 @@ Local transcript context:
 
 
 def save_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -3008,12 +3481,21 @@ def run_final_packaging(
     local_candidates_by_id: dict,
     selected: list[dict],
     force: bool,
+    allow_repair: bool = True,
+    final_max_retries: int = MAX_RETRIES,
+    package_budget_usd: float = 0.0,
 ) -> list[dict]:
     final_packages = []
     packaging_failures: list[dict] = []
     ordered = sorted(selected, key=lambda x: x["global_rank"])
     total = len(ordered)
     for index, item in enumerate(ordered, start=1):
+        if package_budget_exhausted(package_budget_usd):
+            print(
+                f"[package] budget_capped=${package_budget_usd:.2f}; preserving completed final packages",
+                flush=True,
+            )
+            break
         print(f"[package] final packaging {index}/{total} -> rank {item['global_rank']}", flush=True)
         if item["candidate_id"] not in local_candidates_by_id:
             print(
@@ -3025,6 +3507,20 @@ def run_final_packaging(
         candidate["global_rank"] = item["global_rank"]
         candidate["global_score"] = item["global_score"]
         candidate["selection_reason"] = item.get("selection_reason", "")
+        requires_narration = index == 1
+
+        def validate_for_rank(value: dict) -> tuple[bool, str]:
+            ok, message = validate_final_result(value)
+            if not ok:
+                return ok, message
+            if requires_narration:
+                narration = value.get("narration", [])
+                experiment = value.get("experiment", {}) if isinstance(value.get("experiment"), dict) else {}
+                if not isinstance(narration, list) or len(narration) != 1:
+                    return False, "The rank-1 narration test requires exactly one narration item."
+                if str(experiment.get("primary_variable") or "") != "narration":
+                    return False, "The rank-1 narration test must set experiment.primary_variable to narration."
+            return True, ""
         context_segments = extract_candidate_context(merged_segments, candidate)
         package_name = f"short_{int(item['global_rank']):02d}.json"
         out_path = OUTPUT_DIR / "final" / package_name
@@ -3032,11 +3528,16 @@ def run_final_packaging(
         if out_path.exists() and not force:
             with open(out_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if cached.get("candidate_id") == item["candidate_id"] and not BENCHMARK_PROFILE and not LEARNING_RULE:
+            if (
+                cached.get("candidate_id") == item["candidate_id"]
+                and cached.get("on_video_title")
+                and not BENCHMARK_PROFILE
+                and not LEARNING_RULE
+            ):
                 print(f"[package] using cached final package -> {package_name}", flush=True)
                 result = cached
             else:
-                print(f"[package] cached final package candidate changed -> {package_name}", flush=True)
+                print(f"[package] cached final package uses an old title schema or candidate -> {package_name}", flush=True)
         if result is None:
             print(f"[package] requesting final package -> {package_name}", flush=True)
             try:
@@ -3045,10 +3546,25 @@ def run_final_packaging(
                     model,
                     PACKAGING_SYSTEM,
                     build_packaging_prompt(candidate, context_segments, int(item["global_rank"])),
-                    validate_final_result,
+                    validate_for_rank,
                     max_completion_tokens=PACKAGING_MAX_COMPLETION_TOKENS,
+                    max_retries=final_max_retries,
                 )
             except RuntimeError as exc:
+                if not allow_repair:
+                    packaging_failures.append(
+                        {
+                            "candidate_id": item["candidate_id"],
+                            "global_rank": item["global_rank"],
+                            "error": str(exc),
+                            "initial_error": str(exc),
+                        }
+                    )
+                    print(
+                        f"[package] skipped invalid final candidate without extra repair -> {item['candidate_id']}: {exc}",
+                        flush=True,
+                    )
+                    continue
                 message = str(exc)
                 # Repair from the same longform before discarding the story.
                 # The first pass is allowed to follow the local blueprint;
@@ -3078,8 +3594,9 @@ def run_final_packaging(
                             int(item["global_rank"]),
                             repair_note=repair_note,
                         ),
-                        validate_final_result,
+                        validate_for_rank,
                         max_completion_tokens=PACKAGING_MAX_COMPLETION_TOKENS,
+                        max_retries=final_max_retries,
                     )
                 except RuntimeError as repair_exc:
                     packaging_failures.append(
@@ -3105,9 +3622,11 @@ def run_final_packaging(
                 result[key] = candidate.get(key)
         result["audience_topic_signal"] = candidate.get("audience_topic_signal", [])
         result["audience_topic_score"] = candidate.get("audience_topic_score", 0)
+        if candidate.get("candidate_visual_evidence"):
+            result["candidate_visual_evidence"] = candidate["candidate_visual_evidence"]
         if LEARNING_RULE:
             result["learning_rule"] = LEARNING_RULE
-        ok, message = validate_final_result(result)
+        ok, message = validate_for_rank(result)
         if not ok:
             raise RuntimeError(f"Cached/generated final package failed validation: {message}")
         save_json(out_path, result)
@@ -3200,28 +3719,72 @@ def main() -> None:
         print(f"[package] youtube_context comments={fetched} timecode_moments={len(moments)}", flush=True)
     if REFERENCE_STYLE_EXAMPLES:
         print(f"[package] reference_style_examples={len(REFERENCE_STYLE_EXAMPLES)}", flush=True)
-    client = load_client()
-    chunk_records = load_chunk_transcripts(include_wide_windows=not args.no_wide_windows)
     merged_segments = load_merged_segments()
-    print(f"[package] loaded chunk_records={len(chunk_records)}", flush=True)
     print(f"[package] loaded merged_segments={len(merged_segments)}", flush=True)
-
-    local_candidates = run_local_extraction(client, args.model, chunk_records, args.force)
-    anchor_seed_candidates = [] if BENCHMARK_PROFILE else build_anchor_seed_candidates(chunk_records)
-    if anchor_seed_candidates:
-        existing_ids = {candidate.get("candidate_id") for candidate in local_candidates}
-        new_seeds = [candidate for candidate in anchor_seed_candidates if candidate.get("candidate_id") not in existing_ids]
-        local_candidates.extend(new_seeds)
-        print(f"[package] anchor_seed_candidates={len(new_seeds)}", flush=True)
-    attach_audience_topic_signals(local_candidates)
-    save_json(OUTPUT_DIR / "local" / "all_candidates.json", {"candidates": local_candidates})
-    print(f"[package] local_candidates={len(local_candidates)}", flush=True)
-
-    selected_data = run_global_selection(client, args.model, local_candidates, args.force)
-    selected_items = augment_selected_with_audience_topics(selected_data.get("selected", []) or [], local_candidates)
-    if selected_items != (selected_data.get("selected", []) or []):
-        selected_data["selected"] = selected_items
+    client = load_client()
+    if args.timeline_first:
+        # The expensive cross-modal analysis has already produced VISUAL_EVENTS.
+        # Reuse that canonical screenplay locally instead of spending nine calls
+        # to rediscover candidates from overlapping transcript chunks.
+        local_candidates = build_timeline_candidates(merged_segments)
+        attach_audience_topic_signals(local_candidates)
+        refinement_pool_limit = max(
+            args.final_candidate_limit,
+            min(12, max(1, int(args.visual_refinement_candidate_limit))),
+        )
+        selected_items = select_timeline_candidates(local_candidates, refinement_pool_limit)
+        selected_data = {"selection_mode": "timeline_first_local", "selected": selected_items}
+        save_json(OUTPUT_DIR / "local" / "all_candidates.json", {"candidates": local_candidates})
         save_json(OUTPUT_DIR / "global" / "selected_candidates.json", selected_data)
+        print(f"[package] timeline_screenplay_cards={len(VISUAL_EVENTS)}", flush=True)
+        print(f"[package] local_timeline_candidates={len(local_candidates)}", flush=True)
+        if not args.no_candidate_visual_refinement:
+            visually_approved_items = refine_timeline_selected_candidates(
+                local_candidates,
+                selected_items,
+                model=args.visual_refinement_model.strip() or "gpt-5.4",
+                frames_per_clip=args.visual_refinement_frames_per_clip,
+                force=args.force,
+            )
+            # The first local candidates are only a cheap shortlist.  A weak
+            # top-five must be replaced by the next visually proven story, not
+            # rendered merely because it ranked earlier from broad evidence.
+            selected_items = visually_approved_items[: max(1, args.final_candidate_limit)]
+            if len(visually_approved_items) > len(selected_items):
+                save_json(
+                    OUTPUT_DIR / "timeline" / "candidate_visual_reserve.json",
+                    {"reserve": visually_approved_items[len(selected_items) :]},
+                )
+            selected_data["selected"] = selected_items
+            selected_data["candidate_visual_refinement"] = {
+                "enabled": True,
+                "model": args.visual_refinement_model.strip() or "gpt-5.4",
+                "inspected_candidate_count": refinement_pool_limit,
+                "approved_candidate_count": len(visually_approved_items),
+                "evidence_path": str(OUTPUT_DIR / "timeline" / "candidate_visual_evidence.json"),
+            }
+            save_json(OUTPUT_DIR / "local" / "all_candidates.json", {"candidates": local_candidates})
+            save_json(OUTPUT_DIR / "global" / "selected_candidates.json", selected_data)
+        else:
+            print("[package] candidate_visual_refinement=disabled (diagnostic mode)", flush=True)
+    else:
+        chunk_records = load_chunk_transcripts(include_wide_windows=not args.no_wide_windows)
+        print(f"[package] loaded chunk_records={len(chunk_records)}", flush=True)
+        local_candidates = run_local_extraction(client, args.model, chunk_records, args.force)
+        anchor_seed_candidates = [] if BENCHMARK_PROFILE else build_anchor_seed_candidates(chunk_records)
+        if anchor_seed_candidates:
+            existing_ids = {candidate.get("candidate_id") for candidate in local_candidates}
+            new_seeds = [candidate for candidate in anchor_seed_candidates if candidate.get("candidate_id") not in existing_ids]
+            local_candidates.extend(new_seeds)
+            print(f"[package] anchor_seed_candidates={len(new_seeds)}", flush=True)
+        attach_audience_topic_signals(local_candidates)
+        save_json(OUTPUT_DIR / "local" / "all_candidates.json", {"candidates": local_candidates})
+        print(f"[package] local_candidates={len(local_candidates)}", flush=True)
+        selected_data = run_global_selection(client, args.model, local_candidates, args.force)
+        selected_items = augment_selected_with_audience_topics(selected_data.get("selected", []) or [], local_candidates)
+        if selected_items != (selected_data.get("selected", []) or []):
+            selected_data["selected"] = selected_items
+            save_json(OUTPUT_DIR / "global" / "selected_candidates.json", selected_data)
     print(f"[package] selected_items={len(selected_items)}", flush=True)
 
     local_candidates_by_id = {cand["candidate_id"]: cand for cand in local_candidates}
@@ -3239,12 +3802,22 @@ def main() -> None:
             local_candidates_by_id=local_candidates_by_id,
             selected=selected_items,
             force=args.force,
+            # A selected candidate gets no exploratory retries, but a single
+            # schema/validation repair is cheaper than silently losing a
+            # visually verified story because the model omitted one field.
+            allow_repair=True,
+            final_max_retries=1 if args.timeline_first else MAX_RETRIES,
+            package_budget_usd=args.package_budget_usd if args.timeline_first else 0.0,
         )
 
         final_payload = {
             "source_title": SOURCE_TITLE,
             "candidate_model": args.model,
             "final_model": final_model,
+            "selection_mode": "timeline_first_local" if args.timeline_first else "model_chunk_and_rerank",
+            "timeline_screenplay_path": (
+                str(OUTPUT_DIR / "timeline" / "timeline_screenplay.json") if args.timeline_first else ""
+            ),
             "benchmark_profile": {
                 "profile_id": BENCHMARK_PROFILE.get("profile_id", ""),
                 "path": str(args.benchmark_profile) if args.benchmark_profile else "",

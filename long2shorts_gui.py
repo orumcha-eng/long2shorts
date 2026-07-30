@@ -2436,9 +2436,19 @@ class ShortsDashboardApp:
             review = source.get("review", {}) if isinstance(source.get("review"), dict) else {}
             review_count += len([item for item in review.get("items", []) or [] if isinstance(item, dict)])
 
+        usage = summary.get("usage_accounting", {}) if isinstance(summary.get("usage_accounting"), dict) else {}
+        usage_totals = usage.get("totals", {}) if isinstance(usage.get("totals"), dict) else {}
+        token_total = int(usage_totals.get("total_tokens") or 0)
+        estimated_cost = usage_totals.get("estimated_usd")
+        cost_note = ""
+        if usage.get("status") == "completed" and (token_total or estimated_cost is not None):
+            price = f"${float(estimated_cost):.3f}" if estimated_cost is not None else "가격 미산정"
+            cost_note = f" · API 추정 {price} / {token_total:,} 토큰"
+            self.append_log(f"[cost] 이번 제작 {price}, {token_total:,} 토큰 (실제 청구는 OpenAI 대시보드 기준)")
+
         if review_count:
             self.status_var.set("검토 대기")
-            self.run_note_var.set(f"쇼츠 {review_count}개가 검토 대기에 등록됐습니다.")
+            self.run_note_var.set(f"쇼츠 {review_count}개가 검토 대기에 등록됐습니다.{cost_note}")
             self.set_stage("render", "검토", f"검토 대기 {review_count}개 등록")
             return
 
@@ -2454,7 +2464,7 @@ class ShortsDashboardApp:
 
         if rendered_count == 0:
             self.status_var.set("제작 없음")
-            self.run_note_var.set("자동 실행은 끝났지만 렌더된 쇼츠가 없어 검토 대기가 비어 있습니다.")
+            self.run_note_var.set(f"자동 실행은 끝났지만 렌더된 쇼츠가 없어 검토 대기가 비어 있습니다.{cost_note}")
             self.set_stage("render", "보류", "렌더된 MP4가 없습니다.")
 
     def schedule_review_refresh(self) -> None:

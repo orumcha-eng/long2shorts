@@ -17,6 +17,7 @@ from openai import OpenAI
 from PIL import Image, ImageDraw, ImageFont
 
 from env_loader import format_checked_env_paths, load_project_env
+from usage_ledger import append_chat_usage, summarize_usage, usage_log_path
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -34,6 +35,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-interval-sec", type=int, default=DEFAULT_INTERVAL_SEC)
     parser.add_argument("--frames-per-batch", type=int, default=DEFAULT_FRAMES_PER_BATCH)
     parser.add_argument("--max-frames", type=int, default=DEFAULT_MAX_FRAMES)
+    parser.add_argument(
+        "--max-estimated-usd",
+        type=float,
+        default=0.0,
+        help="Stop before starting another visual-analysis batch once this per-run estimated budget is exhausted.",
+    )
     parser.add_argument("--force", action="store_true")
     return parser
 
@@ -185,6 +192,8 @@ Return JSON only:
       "reaction": "Korean: visible/audible reaction; say unknown if not supported",
       "payoff": "Korean: visible or spoken consequence; say unresolved if none",
       "visual_hook": "Korean: concise viewer-facing visual promise",
+      "visual_shortability_score": 0,
+      "editorial_role": "hook|context|escalation|reaction|payoff|unusable",
       "characters": ["role or confirmed name"],
       "frame_timestamps": [0.0],
       "confidence": "high|medium|low"
@@ -222,6 +231,12 @@ def validate_events(payload: Any, frames: list[dict[str, Any]]) -> list[dict[str
         event["characters"] = [str(value).strip() for value in event.get("characters", []) if str(value).strip()][:4]
         if event.get("confidence") not in {"high", "medium", "low"}:
             event["confidence"] = "low"
+        try:
+            event["visual_shortability_score"] = max(0, min(10, int(event.get("visual_shortability_score", 0))))
+        except (TypeError, ValueError):
+            event["visual_shortability_score"] = 0
+        if event.get("editorial_role") not in {"hook", "context", "escalation", "reaction", "payoff", "unusable"}:
+            event["editorial_role"] = "unusable"
         events.append(event)
     return events
 
@@ -242,11 +257,28 @@ def analyze_batch(client: OpenAI, model: str, frames: list[dict[str, Any]], segm
             },
         ],
     )
+    append_chat_usage(
+        stage="visual_event_analysis",
+        model=model,
+        response=response,
+        extra={"frame_count": len(frames)},
+    )
     try:
         payload = json.loads(response.choices[0].message.content or "{}")
     except json.JSONDecodeError:
         return []
     return validate_events(payload, frames)
+
+
+def visual_budget_exhausted(max_estimated_usd: float) -> bool:
+    if max_estimated_usd <= 0:
+        return False
+    path = usage_log_path()
+    if not path or not path.exists():
+        return False
+    summary = summarize_usage(path)
+    visual = summary.get("by_stage", {}).get("visual_event_analysis", {})
+    return float(visual.get("estimated_usd", 0.0) or 0.0) >= max_estimated_usd
 
 
 def main() -> None:
@@ -270,6 +302,17 @@ def main() -> None:
     batches: list[dict[str, Any]] = []
     for offset in range(0, len(frames), frames_per_batch):
         group = frames[offset : offset + frames_per_batch]
+        if visual_budget_exhausted(float(args.max_estimated_usd or 0.0)):
+            batches.append(
+                {
+                    "status": "budget_capped",
+                    "start_sec": group[0]["time_sec"],
+                    "end_sec": group[-1]["time_sec"],
+                    "max_estimated_usd": float(args.max_estimated_usd),
+                }
+            )
+            print(f"[vision] budget_capped=${float(args.max_estimated_usd):.2f}", flush=True)
+            break
         print(f"[vision] batch={offset // frames_per_batch + 1} frames={len(group)}", flush=True)
         try:
             batch_events = analyze_batch(client, args.model, group, segments)
@@ -280,7 +323,7 @@ def main() -> None:
         except Exception as exc:
             batches.append({"status": "failed", "start_sec": group[0]["time_sec"], "end_sec": group[-1]["time_sec"], "error": str(exc)})
     payload = {
-        "version": 1,
+        "version": 2,
         "source_video": str(source_video),
         "model": args.model,
         "sample_interval_sec": interval,

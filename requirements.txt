@@ -4,6 +4,7 @@ pymediainfo>=6,<7
 imageio-ffmpeg>=0.5,<1
 yt-dlp>=2025.1
 pillow>=10,<12
+opencv-python-headless>=4.10,<5
 pycapcut>=0.0.3,<0.1
 google-api-python-client>=2,<3
 google-auth-oauthlib>=1,<2

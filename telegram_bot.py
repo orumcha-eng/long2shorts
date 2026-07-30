@@ -65,6 +65,27 @@ def compact_text(value: str, *, limit: int = MAX_TELEGRAM_MESSAGE) -> str:
     return value if len(value) <= limit else value[: limit - 20] + "\n…(뒤 내용 생략)"
 
 
+def usage_note_from_run_log(log_text: str) -> str:
+    """Return the per-run token/cost note written by the orchestrator, if any."""
+    for line in reversed(log_text.splitlines()):
+        if not line.startswith("[orchestrator] summary="):
+            continue
+        summary = read_json(Path(line.split("=", 1)[1].strip()), {})
+        if not isinstance(summary, dict):
+            return ""
+        usage = summary.get("usage_accounting")
+        totals = usage.get("totals") if isinstance(usage, dict) else None
+        if not isinstance(totals, dict):
+            return ""
+        tokens = int(totals.get("total_tokens") or 0)
+        cost = totals.get("estimated_usd")
+        if not tokens and cost is None:
+            return ""
+        price = f"${float(cost):.3f}" if cost is not None else "가격 미산정"
+        return f"\n💳 API 추정 {price} · {tokens:,} 토큰\n(실제 청구는 OpenAI 대시보드 기준)"
+    return ""
+
+
 class Long2ShortsTelegramBot:
     def __init__(self, token: str, allowed_chat_ids: set[int]) -> None:
         self.token = token
@@ -514,6 +535,8 @@ class Long2ShortsTelegramBot:
                 message = "\u26d4 \uad8c\ub9ac\uac00 \ud655\uc778\ub41c \uc6d0\ubcf8\uc774 \uc5c6\uc5b4 \uc81c\uc791\uc744 \uba48\ucdc4\uc5b4\uc694. \uc18c\uc720\ud588\uac70\ub098 \uc0ac\uc6a9 \ud5c8\uac00\ub97c \ubc1b\uc740 \uc601\uc0c1\uc744 \ub4f1\ub85d\ud574 \uc8fc\uc138\uc694."
             else:
                 message = f"\u274c {name}\uc5d0 \ubb38\uc81c\uac00 \uc0dd\uacbc어요. /logs\ub97c \ubcf4\ub0b4\uba74 \uc0c1\uc138 \ub0b4\uc6a9을 \ud655\uc778\ud560 \uc218 \uc788\uc5b4\uc694."
+        if exit_code == 0:
+            message += usage_note_from_run_log(log_text)
         try:
             self.send(chat_id, message)
         except RuntimeError:

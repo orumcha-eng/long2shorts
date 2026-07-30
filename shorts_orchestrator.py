@@ -14,7 +14,11 @@ import sys
 import traceback
 from typing import Any
 
+import cv2
+import numpy as np
+
 from env_loader import load_project_env
+from usage_ledger import summarize_usage
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +27,15 @@ DEFAULT_DB_PATH = AUTOMATION_DIR / "orchestrator.sqlite3"
 DEFAULT_CONFIG_PATH = BASE_DIR / "automation_config.json"
 DEFAULT_BENCHMARK_PROFILE = "templates/benchmark_profiles/rescene_gyaru_variety.json"
 VIDEO_FILE_SUFFIXES = {".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi"}
+# YouTube's Entertainment category is not a content-format guarantee: it
+# frequently contains stock-market, political-commentary and breaking-news
+# channels. These are not a suitable input for reaction-led Korean variety
+# Shorts, independently of whether they are technically in category 24.
+ALWAYS_BLOCKED_SOURCE_TERMS = (
+    "런닝맨", "running man", "정치", "대통령", "국회", "선거", "국회의원", "민주당", "국민의힘",
+    "주식", "증시", "대폭락", "코인", "비트코인", "시황", "부동산", "경제 브리핑",
+    "뉴스", "속보", "브리핑", "사건사고", "긴급", "시사",
+)
 # Shorts usually reveal their initial response quickly.  Keep the feedback
 # loop inside the first day instead of waiting several days for every test.
 CHECKPOINT_HOURS = (1, 3, 6, 12, 24)
@@ -38,6 +51,15 @@ def project_python_executable() -> str:
     """Use the project runtime even when the CLI was launched by a bare IDE Python."""
     venv_python = BASE_DIR / ".venv" / "Scripts" / "python.exe"
     return str(venv_python if venv_python.exists() else Path(sys.executable))
+
+
+def subprocess_environment(config: dict[str, Any]) -> dict[str, str]:
+    """Pass the per-run usage ledger to every OpenAI-using child process."""
+    environment = dict(os.environ)
+    usage_path = str(config.get("_usage_log_path") or "").strip()
+    if usage_path:
+        environment["SHORTS_USAGE_LOG_PATH"] = usage_path
+    return environment
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "library": {
@@ -67,6 +89,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "candidate_model": "gpt-5.4",
         "final_model": "gpt-5.6-sol",
         "include_wide_windows": True,
+        "timeline_first": True,
+        "final_candidate_limit": 5,
+        "run_budget_usd": 0.0,
+        "final_package_reserve_usd": 0.0,
+        "budget_safety_usd": 0.0,
+        "candidate_visual_refinement": {
+            "enabled": True,
+            "model": "gpt-5.4",
+            "frames_per_clip": 2,
+            "candidate_limit": 10,
+        },
         "force": False,
     },
     "visual_events": {
@@ -76,11 +109,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "frames_per_batch": 6,
         "max_frames": 180,
     },
+    "source_visual_gate": {
+        "enabled": True,
+        "sample_count": 12,
+        "max_bright_document_ratio": 0.35,
+    },
     "production": {
         "enabled": True,
         "minimum_packages_per_source": "auto",
         "minimum_score": 85,
         "minimum_duration_sec_exclusive": 20.0,
+        "minimum_visual_shortability_score": 6,
+        "rendered_visual_qa": {
+            "enabled": True,
+            "max_bright_document_ratio": 0.25,
+            "sample_count": 5,
+        },
         "allowed_decisions": ["auto_render"],
     },
     "source_safety": {
@@ -716,6 +760,15 @@ def source_safety_reason(config: dict[str, Any], source: dict[str, Any]) -> str:
     normalized_title = re.sub(r"\s+", " ", title).strip().casefold()
     normalized_channel = re.sub(r"\s+", " ", channel).strip().casefold()
 
+    # YouTube's Entertainment category contains music and global fan content
+    # as well as Korean variety.  For this Korean variety workflow, reject a
+    # title with no meaningful Hangul signal before downloading it.
+    minimum_korean_title_characters = max(0, int(safety.get("minimum_korean_title_characters", 0) or 0))
+    if minimum_korean_title_characters and title:
+        hangul_count = len(re.findall(r"[가-힣]", title))
+        if hangul_count < minimum_korean_title_characters:
+            return f"source title is not Korean-variety suitable: {title}"
+
     for value in safety.get("blocked_channels", []) or []:
         blocked = str(value or "").strip().casefold()
         if blocked and normalized_channel and (blocked in normalized_channel or normalized_channel in blocked):
@@ -728,13 +781,67 @@ def source_safety_reason(config: dict[str, Any], source: dict[str, Any]) -> str:
         blocked = str(value or "").strip().casefold()
         if blocked and blocked in normalized_title:
             return f"blocked broadcaster source title: {title}"
-    for value in safety.get("blocked_terms", []) or []:
+    # Configuration-specific exclusions are additive. A local config cannot
+    # accidentally remove baseline broadcaster/politics/finance protections.
+    blocked_terms = [*ALWAYS_BLOCKED_SOURCE_TERMS, *(safety.get("blocked_terms", []) or [])]
+    for value in blocked_terms:
         blocked = str(value or "").strip().casefold()
         if blocked and (blocked in normalized_title or blocked in normalized_channel):
             return f"blocked source term: {value}"
     if bool(safety.get("require_verified_owned_source", False)) and not bool(source.get("owned", False)):
         return "source rights are not verified; use a rights-cleared owned library source"
     return ""
+
+
+def source_visual_preflight(config: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
+    """Reject document/screen-share sources before expensive visual LLM analysis.
+
+    The aim is not to judge whether a video is technically valid.  It is to
+    prevent a Korean variety Shorts workflow from spending 180-frame vision
+    analysis on a lecture, article page, or desktop capture that cannot become
+    an actor/reaction-led vertical short.
+    """
+    settings = config.get("source_visual_gate", {}) if isinstance(config.get("source_visual_gate"), dict) else {}
+    if not bool(settings.get("enabled", True)):
+        return {"status": "disabled"}
+    source_video = source.get("source_video")
+    if not isinstance(source_video, Path) or not source_video.exists():
+        return {"status": "unavailable", "reason": "source video is unavailable for visual preflight"}
+    cap = cv2.VideoCapture(str(source_video))
+    if not cap.isOpened():
+        return {"status": "unavailable", "reason": "OpenCV could not read source video"}
+    try:
+        frame_count = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
+        sample_count = max(6, int(settings.get("sample_count", 12) or 12))
+        indices = sorted({int(round((frame_count - 1) * ratio)) for ratio in np.linspace(0.05, 0.95, sample_count)})
+        bright_ratios: list[float] = []
+        for frame_index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                bright_ratios.append(float(np.mean(np.all(frame >= 242, axis=2))))
+        if not bright_ratios:
+            return {"status": "unavailable", "reason": "source samples could not be read"}
+        median_ratio = float(np.median(bright_ratios))
+        threshold = float(settings.get("max_bright_document_ratio", 0.35) or 0.35)
+        result = {
+            "sampled_frames": len(bright_ratios),
+            "bright_document_ratio_median": round(median_ratio, 4),
+            "bright_document_ratio_max": round(float(max(bright_ratios)), 4),
+            "maximum_allowed_ratio": threshold,
+        }
+        if median_ratio > threshold:
+            return {
+                "status": "blocked",
+                "reason": (
+                    f"source is document/screen-share dominant ({median_ratio:.0%} bright area; "
+                    f"maximum {threshold:.0%})"
+                ),
+                **result,
+            }
+        return {"status": "pass", **result}
+    finally:
+        cap.release()
 
 
 def acquired_source_from_context(
@@ -793,6 +900,10 @@ def acquire_selected_trend_source(
         return {"status": "no_selected_trend_source"}
     max_attempts = max(1, int(acquisition.get("max_attempts", 5) or 5))
     minimum_source_duration = max(1, int(acquisition.get("minimum_source_duration_sec", 480) or 480))
+    maximum_source_duration = max(
+        minimum_source_duration,
+        int(acquisition.get("maximum_source_duration_sec", 3600) or 3600),
+    )
     attempts: list[dict[str, Any]] = []
     download_attempts = 0
 
@@ -804,7 +915,7 @@ def acquire_selected_trend_source(
             duration = float(candidate.get("duration_sec") or 0)
         except (TypeError, ValueError):
             return False
-        return duration >= minimum_source_duration and not source_safety_reason(
+        return minimum_source_duration <= duration <= maximum_source_duration and not source_safety_reason(
             config,
             {
                 "source_title": candidate.get("title"),
@@ -831,7 +942,15 @@ def acquire_selected_trend_source(
         trend_config_path = resolve_path(trend.get("config_path"))
         if trend_config_path and trend_config_path.exists():
             command.extend(["--config", str(trend_config_path)])
-        completed = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        completed = subprocess.run(
+            command,
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=subprocess_environment(config),
+        )
         fallback_snapshot = read_json(fallback_path, {}) if completed.returncode == 0 else {}
         fallback_candidates = trend_candidate_attempts({"snapshot": fallback_snapshot}) if isinstance(fallback_snapshot, dict) else []
         eligible_fallbacks = [candidate for candidate in fallback_candidates if is_eligible_longform(candidate)]
@@ -863,6 +982,15 @@ def acquire_selected_trend_source(
                     "status": "skipped_short_source",
                     "candidate": candidate,
                     "reason": f"source is {candidate_duration:.0f}s; requires at least {minimum_source_duration}s",
+                }
+            )
+            continue
+        if candidate_duration and candidate_duration > maximum_source_duration:
+            attempts.append(
+                {
+                    "status": "skipped_oversized_source",
+                    "candidate": candidate,
+                    "reason": f"source is {candidate_duration:.0f}s; maximum is {maximum_source_duration}s",
                 }
             )
             continue
@@ -943,12 +1071,23 @@ def acquire_selected_trend_source(
             attempt["status"] = "blocked"
             attempt["reason"] = block_reason
             continue
+        # Downloading/transcribing is unavoidable for a source-level visual
+        # check, but vision-model analysis is not.  Reject a document-heavy
+        # source here and keep trying the ranked list instead of returning it
+        # to the main run where it would consume an expensive event script.
+        visual_gate = source_visual_preflight(config, source)
+        attempt["source_visual_gate"] = visual_gate
+        if visual_gate.get("status") != "pass":
+            attempt["status"] = "blocked"
+            attempt["reason"] = str(visual_gate.get("reason") or "source visual preflight did not pass")
+            continue
         if source.get("ready") or source.get("source_video"):
             return {
                 "status": "completed",
                 "source": source,
                 "summary": trend_source_summary(source),
                 "context_path": str(context_path),
+                "source_visual_gate": visual_gate,
                 "attempts": attempts,
                 "log_tail": completed.stdout.splitlines()[-16:],
             }
@@ -963,7 +1102,7 @@ def acquire_selected_trend_source(
     }
 
 
-def mark_acquired_source_processed(source: dict[str, Any], render: dict[str, Any]) -> None:
+def mark_acquired_source_processed(source: dict[str, Any], render: dict[str, Any], *, allow_zero: bool = False) -> None:
     source_url = str(source.get("source_url") or "")
     match = re.search(r"(?:v=|youtu\.be/|shorts/|embed/|live/)([A-Za-z0-9_-]{11})", source_url)
     video_id = match.group(1) if match else ""
@@ -981,7 +1120,7 @@ def mark_acquired_source_processed(source: dict[str, Any], render: dict[str, Any
             if isinstance(item, dict) and item.get("status") == "completed"
         ]
     )
-    if rendered_count <= 0:
+    if rendered_count <= 0 and not allow_zero:
         return
     command = [
         project_python_executable(),
@@ -1517,9 +1656,24 @@ def ensure_visual_event_script(config: dict[str, Any], source: dict[str, Any], *
         "--max-frames",
         str(max(1, int(settings.get("max_frames", 180) or 180))),
     ]
+    generation = config.get("generation", {}) if isinstance(config.get("generation"), dict) else {}
+    total_budget = float(generation.get("run_budget_usd", 0.0) or 0.0)
+    final_reserve = float(generation.get("final_package_reserve_usd", 0.0) or 0.0)
+    safety = float(generation.get("budget_safety_usd", 0.0) or 0.0)
+    visual_budget = max(0.0, total_budget - final_reserve - safety)
+    if visual_budget > 0:
+        command.extend(["--max-estimated-usd", f"{visual_budget:.3f}"])
     if bool(settings.get("force", False)):
         command.append("--force")
-    completed = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    completed = subprocess.run(
+        command,
+        cwd=BASE_DIR,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=subprocess_environment(config),
+    )
     if completed.returncode != 0:
         return {"status": "failed", "error": completed.stderr.strip() or completed.stdout.strip()}
     return {"status": "ready" if output_path.exists() else "failed", "path": str(output_path), "log_tail": completed.stdout.splitlines()[-8:]}
@@ -1618,6 +1772,32 @@ def generate_for_source(
         "--output-dir",
         str(package_root),
     ]
+    if bool(generation.get("timeline_first", True)):
+        command.append("--timeline-first")
+        command.extend(
+            [
+                "--final-candidate-limit",
+                str(max(1, min(8, int(generation.get("final_candidate_limit", 5) or 5)))),
+            ]
+        )
+        refinement = generation.get("candidate_visual_refinement", {})
+        refinement = refinement if isinstance(refinement, dict) else {}
+        if not bool(refinement.get("enabled", True)):
+            command.append("--no-candidate-visual-refinement")
+        else:
+            command.extend(
+                [
+                    "--visual-refinement-model",
+                    str(refinement.get("model") or "gpt-5.4"),
+                    "--visual-refinement-frames-per-clip",
+                    str(max(1, min(3, int(refinement.get("frames_per_clip", 2) or 2)))),
+                    "--visual-refinement-candidate-limit",
+                    str(max(1, min(12, int(refinement.get("candidate_limit", 10) or 10)))),
+                ]
+            )
+        package_budget = float(generation.get("final_package_reserve_usd", 0.0) or 0.0)
+        if package_budget > 0:
+            command.extend(["--package-budget-usd", f"{package_budget:.3f}"])
     benchmark_profile = resolve_path(config.get("benchmark_profile"))
     if benchmark_profile and benchmark_profile.exists():
         command.extend(["--benchmark-profile", str(benchmark_profile)])
@@ -1631,7 +1811,15 @@ def generate_for_source(
         command.append("--no-wide-windows")
     if bool(generation.get("force", False)):
         command.append("--force")
-    completed = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    completed = subprocess.run(
+        command,
+        cwd=BASE_DIR,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=subprocess_environment(config),
+    )
     if completed.returncode != 0:
         return {"status": "failed", "error": completed.stderr.strip() or completed.stdout.strip()}
     annotated = annotate_packages(
@@ -1671,23 +1859,55 @@ def render_for_source(
     aggregate_path = package_root / "final" / "shorts_packages.json"
     aggregate = read_json(aggregate_path, {})
     packages = aggregate.get("shorts", []) if isinstance(aggregate, dict) else []
+    # A cost cap or a manual stop can happen after individual final packages
+    # have been safely written but before the aggregate index is emitted.
+    # Those already-validated packages are renderable; do not make the user
+    # pay to regenerate them merely to recreate an index file.
+    if not isinstance(packages, list) or not packages:
+        final_dir = package_root / "final"
+        packages = [
+            read_json(path, {})
+            for path in sorted(final_dir.glob("short_*.json"))
+            if path.is_file()
+        ]
     if not isinstance(packages, list):
         return {"status": "missing_output", "path": str(aggregate_path)}
 
     minimum_score = int(production.get("minimum_score", 85) or 0)
+    minimum_visual_score = int(production.get("minimum_visual_shortability_score", 6) or 0)
     minimum_duration = float(production.get("minimum_duration_sec_exclusive", 20.0) or 20.0)
     required_minimum = production_minimum_render_count(production, source)
     allowed_decisions = {str(value) for value in production.get("allowed_decisions", ["auto_render"]) or []}
     selected: list[dict[str, Any]] = []
     for package in sorted(
         (item for item in packages if isinstance(item, dict)),
-        key=lambda item: (int(item.get("score", 0) or 0), -int(item.get("global_rank", 999) or 999)),
+        # The first package is the deliberate controlled experiment.  Do not
+        # silently replace it with a higher-score non-experiment package, or
+        # a required narration/reframe test can be generated on paper but
+        # never reach a real rendered review candidate.
+        key=lambda item: (
+            int(item.get("global_rank", 999) or 999) == 1
+            and bool(item.get("narration") or []),
+            int(item.get("score", 0) or 0),
+            -int(item.get("global_rank", 999) or 999),
+        ),
         reverse=True,
     ):
         score = int(package.get("score", 0) or 0)
         scorecard = package.get("genre_scorecard", {}) if isinstance(package.get("genre_scorecard"), dict) else {}
         decision = str(scorecard.get("decision") or package.get("decision") or "")
         if score < minimum_score or (allowed_decisions and decision not in allowed_decisions):
+            continue
+        dimensions = scorecard.get("dimensions", []) if isinstance(scorecard.get("dimensions"), list) else []
+        visual_score = next(
+            (
+                int(dimension.get("score", 0) or 0)
+                for dimension in dimensions
+                if isinstance(dimension, dict) and str(dimension.get("id") or "") == "visual_shortability"
+            ),
+            None,
+        )
+        if visual_score is not None and visual_score < minimum_visual_score:
             continue
         short_id = str(package.get("short_id") or "").strip()
         if not short_id:
@@ -1744,7 +1964,15 @@ def render_for_source(
             "--output",
             str(output_path),
         ]
-        completed = subprocess.run(command, cwd=BASE_DIR, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        completed = subprocess.run(
+            command,
+            cwd=BASE_DIR,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=subprocess_environment(config),
+        )
         output_is_valid = output_path.exists() and output_path.is_file() and output_path.stat().st_size > 1024
         entry = {
             **candidate,
@@ -1861,7 +2089,58 @@ def probe_video_output(output_path: Path) -> dict[str, Any]:
     }
 
 
-def auto_review_render(output_path: Path, *, minimum_duration_exclusive: float = 20.0) -> dict[str, Any]:
+def inspect_rendered_footage(output_path: Path, *, sample_count: int = 5) -> dict[str, Any]:
+    """Measure the actual footage area, excluding the permanent header/footer.
+
+    A technically valid 9:16 encode can still be an unusable Short when a
+    browser/document slide occupies most of the visible frame.  This catches
+    that class of failure before a human approval or upload is possible.
+    """
+    cap = cv2.VideoCapture(str(output_path))
+    if not cap.isOpened():
+        return {"status": "unavailable", "reason": "OpenCV could not read rendered video"}
+    try:
+        frame_count = max(1, int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1))
+        indices = sorted({int(round((frame_count - 1) * ratio)) for ratio in np.linspace(0.12, 0.88, max(3, sample_count))})
+        bright_ratios: list[float] = []
+        motion_scores: list[float] = []
+        previous_gray = None
+        for frame_index in indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            height, width = frame.shape[:2]
+            top = max(0, min(height - 1, round(height * (260 / 1920))))
+            bottom = max(top + 1, min(height, round(height * (1488 / 1920))))
+            footage = frame[top:bottom, :]
+            if footage.size == 0:
+                continue
+            bright_mask = np.all(footage >= 242, axis=2)
+            bright_ratios.append(float(np.mean(bright_mask)))
+            gray = cv2.cvtColor(footage, cv2.COLOR_BGR2GRAY)
+            if previous_gray is not None and previous_gray.shape == gray.shape:
+                motion_scores.append(float(np.mean(cv2.absdiff(gray, previous_gray))))
+            previous_gray = gray
+        if not bright_ratios:
+            return {"status": "unavailable", "reason": "No representative footage frames were readable"}
+        return {
+            "status": "completed",
+            "sampled_frames": len(bright_ratios),
+            "bright_document_ratio_median": round(float(np.median(bright_ratios)), 4),
+            "bright_document_ratio_max": round(float(max(bright_ratios)), 4),
+            "low_motion_score_median": round(float(np.median(motion_scores)), 4) if motion_scores else 0.0,
+        }
+    finally:
+        cap.release()
+
+
+def auto_review_render(
+    output_path: Path,
+    *,
+    minimum_duration_exclusive: float = 20.0,
+    visual_qa: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     checks: dict[str, Any] = {"output_path": str(output_path)}
     issues: list[str] = []
     warnings: list[str] = []
@@ -1889,6 +2168,23 @@ def auto_review_render(output_path: Path, *, minimum_duration_exclusive: float =
     else:
         warnings.append(str(probe.get("reason") or "ffprobe failed"))
 
+    visual_settings = visual_qa or {}
+    if bool(visual_settings.get("enabled", True)):
+        visual = inspect_rendered_footage(
+            output_path,
+            sample_count=max(3, int(visual_settings.get("sample_count", 5) or 5)),
+        )
+        checks["visual_footage"] = visual
+        if visual.get("status") == "completed":
+            maximum_ratio = float(visual_settings.get("max_bright_document_ratio", 0.25) or 0.25)
+            observed_ratio = float(visual.get("bright_document_ratio_median") or 0.0)
+            if observed_ratio > maximum_ratio:
+                issues.append(
+                    f"visible footage is {observed_ratio:.0%} bright document/empty area; maximum is {maximum_ratio:.0%}"
+                )
+        else:
+            warnings.append(str(visual.get("reason") or "visual footage inspection unavailable"))
+
     qa_status = "fail" if issues else ("warning" if warnings else "pass")
     return {"qa_status": qa_status, "checks": checks, "issues": issues, "warnings": warnings}
 
@@ -1900,6 +2196,7 @@ def register_review_items(
     run_id: str,
     render: dict[str, Any],
     minimum_duration_exclusive: float = 20.0,
+    visual_qa: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     rendered = [item for item in render.get("rendered", []) or [] if isinstance(item, dict)]
     entries: list[dict[str, Any]] = []
@@ -1908,7 +2205,11 @@ def register_review_items(
             continue
         output_path = Path(str(item["output_path"])).resolve()
         package_path = Path(str(item.get("package_path") or "")).resolve()
-        qa = auto_review_render(output_path, minimum_duration_exclusive=minimum_duration_exclusive)
+        qa = auto_review_render(
+            output_path,
+            minimum_duration_exclusive=minimum_duration_exclusive,
+            visual_qa=visual_qa,
+        )
         if output_path.exists():
             content_sha256 = file_sha256(output_path)
         else:
@@ -1998,7 +2299,14 @@ def list_review_items(conn: sqlite3.Connection, *, status: str, limit: int) -> l
     return [dict(row) for row in rows]
 
 
-def record_review_decision(conn: sqlite3.Connection, *, output_path: Path, status: str, note: str) -> dict[str, Any]:
+def record_review_decision(
+    conn: sqlite3.Connection,
+    config: dict[str, Any],
+    *,
+    output_path: Path,
+    status: str,
+    note: str,
+) -> dict[str, Any]:
     resolved = str(output_path.resolve())
     # A batch can be re-rendered at the same output path.  Approval must bind
     # to the bytes the reviewer can currently see, never to the oldest row
@@ -2023,7 +2331,12 @@ def record_review_decision(conn: sqlite3.Connection, *, output_path: Path, statu
         ).fetchone()
         if not source_row or not bool(source_row["active"]):
             raise RuntimeError("Approval blocked: this source has been disabled by the source-safety check.")
-        qa = auto_review_render(Path(str(row["output_path"])).resolve(), minimum_duration_exclusive=20.0)
+        production = config.get("production", {}) if isinstance(config.get("production"), dict) else {}
+        qa = auto_review_render(
+            Path(str(row["output_path"])).resolve(),
+            minimum_duration_exclusive=float(production.get("minimum_duration_sec_exclusive", 20.0) or 20.0),
+            visual_qa=production.get("rendered_visual_qa") if isinstance(production.get("rendered_visual_qa"), dict) else None,
+        )
         if qa["qa_status"] == "fail":
             raise RuntimeError("Approval blocked: the rendered video failed the mandatory safety/length check.")
     conn.execute(
@@ -2040,6 +2353,15 @@ def record_review_decision(conn: sqlite3.Connection, *, output_path: Path, statu
         (row["content_sha256"],),
     ).fetchone()
     return dict(updated) if updated else {}
+
+
+def strip_title_emoji(value: str) -> str:
+    """Keep YouTube upload titles text-only, even if an older package used emoji."""
+    return "".join(
+        char
+        for char in str(value or "")
+        if not (0x1F000 <= ord(char) <= 0x1FAFF or 0x2600 <= ord(char) <= 0x27BF)
+    )
 
 
 def youtube_upload_metadata(package_path: Path) -> dict[str, Any]:
@@ -2080,9 +2402,9 @@ def youtube_upload_metadata(package_path: Path) -> dict[str, Any]:
         "캐릭터": "✨",
     }
     lead_emoji = next((emoji_by_tag[tag] for tag in tags if tag in emoji_by_tag), "🎬")
-    title = f"{lead_emoji} {title}"[:100]
-    if pitch:
-        pitch = f"{lead_emoji} {pitch}"
+    # Upload titles must be plain human-written text.  Do not inherit an
+    # emoji from fun-tags, and strip one from older package metadata too.
+    title = strip_title_emoji(title).strip()[:100]
     hashtag_line = " ".join(f"#{re.sub(r'[^0-9A-Za-z가-힣_]', '', tag)}" for tag in tags[:8])
     attribution = f"📺 원본 전체 영상은 {source_channel}에서 확인하세요.\n🔗 원본 링크: {source_url}"
     description = "\n\n".join(part for part in (pitch, attribution, hashtag_line, "#shorts") if part)[:5000]
@@ -2471,7 +2793,12 @@ def upload_approved_reviews(
     eligible_rows = []
     blocked_outputs: list[str] = []
     for row in rows:
-        qa = auto_review_render(Path(str(row["output_path"])).resolve(), minimum_duration_exclusive=20.0)
+        production = config.get("production", {}) if isinstance(config.get("production"), dict) else {}
+        qa = auto_review_render(
+            Path(str(row["output_path"])).resolve(),
+            minimum_duration_exclusive=float(production.get("minimum_duration_sec_exclusive", 20.0) or 20.0),
+            visual_qa=production.get("rendered_visual_qa") if isinstance(production.get("rendered_visual_qa"), dict) else None,
+        )
         if qa["qa_status"] == "fail":
             blocked_outputs.append(str(row["output_path"]))
             conn.execute(
@@ -2805,6 +3132,9 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
     run_id = run_id_for()
     run_dir = AUTOMATION_DIR / "runs" / run_id
     summary_path = run_dir / "run_summary.json"
+    usage_path = run_dir / "openai_usage.jsonl"
+    # This key is runtime-only; it is never written into automation_config.
+    config["_usage_log_path"] = str(usage_path)
     dry_run = not bool(args.execute)
     conn.execute(
         "INSERT INTO runs (run_id, requested_at, status, dry_run, summary_path) VALUES (?, ?, ?, ?, ?)",
@@ -2819,6 +3149,7 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
         "status": "running",
         "config_path": str(config_path),
         "db_path": str(db_path),
+        "usage_accounting": {"status": "collecting", "path": str(usage_path)},
     }
     try:
         analytics = config.get("youtube_analytics", {}) if isinstance(config.get("youtube_analytics"), dict) else {}
@@ -2919,8 +3250,16 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
             analysis_result = ensure_source_analysis(source, execute=bool(args.execute))
             item = {"source_key": source["source_key"], "analysis": analysis_result}
             if analysis_result["status"] == "ready":
-                print(f"[orchestrator] phase=visual_event_script source={source['source_title']}", flush=True)
-                item["visual_events"] = ensure_visual_event_script(config, source, execute=bool(args.execute))
+                print(f"[orchestrator] phase=source_visual_gate source={source['source_title']}", flush=True)
+                item["source_visual_gate"] = source_visual_preflight(config, source)
+                if item["source_visual_gate"].get("status") == "pass":
+                    print(f"[orchestrator] phase=visual_event_script source={source['source_title']}", flush=True)
+                    item["visual_events"] = ensure_visual_event_script(config, source, execute=bool(args.execute))
+                else:
+                    item["visual_events"] = {
+                        "status": "skipped",
+                        "reason": item["source_visual_gate"].get("reason", "source visual preflight did not pass"),
+                    }
                 if item["visual_events"].get("status") == "ready":
                     print(f"[orchestrator] phase=package_generation source={source['source_title']}", flush=True)
                     item["generation"] = generate_for_source(
@@ -2935,7 +3274,9 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     item["generation"] = {
                         "status": "failed",
-                        "error": "visual event script was not ready; candidate generation was intentionally skipped",
+                        "error": item["visual_events"].get(
+                            "reason", "visual event script was not ready; candidate generation was intentionally skipped"
+                        ),
                     }
                 if item["generation"].get("status") == "completed":
                     print(f"[orchestrator] phase=render source={source['source_title']}", flush=True)
@@ -2963,6 +3304,9 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
                                     )
                                     or 20.0
                                 ),
+                                visual_qa=(config.get("production", {}) if isinstance(config.get("production"), dict) else {}).get(
+                                    "rendered_visual_qa"
+                                ),
                             )
                         print(f"[orchestrator] phase=upload source={source['source_title']}", flush=True)
                         item["upload"] = upload_rendered_outputs(
@@ -2977,6 +3321,16 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
                             and bool(acquisition_config.get("mark_processed_after_render", True))
                         ):
                             mark_acquired_source_processed(source, item["render"])
+                elif (
+                    item["generation"].get("status") == "failed"
+                    and source.get("source_origin") == "trend_acquisition"
+                    and "All selected candidates failed dense visual verification" in str(item["generation"].get("error") or "")
+                ):
+                    # This source passed download/safety checks but offered no
+                    # complete, visually proven Shorts story.  Do not spend
+                    # another run re-testing the same weak longform.
+                    mark_acquired_source_processed(source, {"rendered": []}, allow_zero=True)
+                    conn.execute("UPDATE library_sources SET active = 0 WHERE source_key = ?", (source["source_key"],))
                 conn.execute(
                     "UPDATE library_sources SET last_selected_at = ? WHERE source_key = ?",
                     (iso_time(), source["source_key"]),
@@ -3014,6 +3368,7 @@ def run_daily(args: argparse.Namespace) -> dict[str, Any]:
         conn.execute("UPDATE runs SET status = ?, error_text = ? WHERE run_id = ?", ("failed", str(exc), run_id))
         conn.commit()
     finally:
+        summary["usage_accounting"] = summarize_usage(usage_path)
         write_json(summary_path, summary)
         conn.close()
     return summary
@@ -3028,6 +3383,16 @@ def print_daily_summary(summary: dict[str, Any]) -> None:
         print(f"[orchestrator] change_note={rule.get('change_note', '')}", flush=True)
     metrics = summary.get("metrics_sync", {}) if isinstance(summary.get("metrics_sync"), dict) else {}
     print(f"[orchestrator] metrics_sync={metrics.get('status', '')}", flush=True)
+    usage = summary.get("usage_accounting", {}) if isinstance(summary.get("usage_accounting"), dict) else {}
+    usage_totals = usage.get("totals", {}) if isinstance(usage.get("totals"), dict) else {}
+    if usage.get("status") == "completed":
+        print(
+            "[orchestrator] "
+            f"usage_tokens={usage_totals.get('total_tokens', 0)} "
+            f"estimated_usd={float(usage_totals.get('estimated_usd', 0.0) or 0.0):.4f} "
+            f"unpriced_events={usage_totals.get('unpriced_events', 0)}",
+            flush=True,
+        )
     acquisition = summary.get("source_acquisition", {}) if isinstance(summary.get("source_acquisition"), dict) else {}
     if acquisition:
         acquisition_summary = acquisition.get("summary", {}) if isinstance(acquisition.get("summary"), dict) else {}
@@ -3236,6 +3601,9 @@ def main() -> None:
                     )
                     or 20.0
                 ),
+                visual_qa=(config.get("production", {}) if isinstance(config.get("production"), dict) else {}).get(
+                    "rendered_visual_qa"
+                ),
             )
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
         conn.close()
@@ -3273,8 +3641,10 @@ def main() -> None:
             flush=True,
         )
     elif args.command == "review-decision":
+        config = load_config(args.config.resolve())
         result = record_review_decision(
             conn,
+            config,
             output_path=args.output,
             status=args.status,
             note=args.note,

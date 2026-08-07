@@ -189,6 +189,7 @@ The attached contact sheet shows dense samples from the *planned candidate cuts*
 Return JSON only in Korean:
 {{
   "verdict": "ready|reject",
+  "story_type": "visual_event|conversation_banter|food_reaction",
   "story": "한 문장으로, 화면과 대사로 확인된 사건",
   "grounded_title_facts": ["제목에 안전하게 쓸 수 있는 구체적 사실"],
   "safe_hook": "첫 컷에서 실제로 보이거나 들리는 훅",
@@ -204,8 +205,11 @@ Rules:
 - Do not identify an unseen person, motive, or consequence from guesswork.
 - A usable title needs a subject/role, concrete action or line, and a visible/audible reaction or consequence.
 - Reject a candidate that is only continuous ordinary talk, has no understandable trigger, or whose payoff is not actually evidenced.
+- Do not confuse a static camera with a weak story. A conversation_banter or food_reaction candidate may remain in one setting when timestamped dialogue plus the sampled faces or food clearly show a concrete trigger, escalation or answer, and reaction/payoff.
+- A bridge cut can remain usable when it preserves the same people and situation while the escalation is carried by dialogue. Do not reject it solely because no new visual event occurs in that frame.
+- Still reject vague conversation whose dialogue could be moved to any episode, or a supposed punchline not supported by the supplied timestamped dialogue.
 - A polite greeting, seating 안내, or the start of another conversation is not a payoff. Reject it unless a concrete joke, reversal, answer, or strong reaction closes the same event.
-- Use ready only when both story_strength and payoff_strength are 7 or higher out of 10.
+- Use ready for visual_event only when both story_strength and payoff_strength are 7 or higher out of 10. For conversation_banter and food_reaction, 6 or higher is enough when trigger, escalation, and payoff are explicitly grounded in the transcript and the same situation is visually confirmed.
 - Do not write a finished catchy title. Supply only facts the final editor may use.
 - Check every numbered cut; do not approve a candidate merely because one still frame looks good.
 
@@ -227,18 +231,32 @@ def validate(payload: Any, candidate: dict[str, Any]) -> dict[str, Any]:
     facts = [str(item).strip() for item in result.get("grounded_title_facts", []) if str(item).strip()][:5]
     cut_evidence = [item for item in result.get("cut_evidence", []) if isinstance(item, dict)][:10]
     has_usable = any(bool(item.get("usable")) for item in cut_evidence)
+    story_type = str(result.get("story_type") or "visual_event").strip().lower()
+    if story_type not in {"visual_event", "conversation_banter", "food_reaction"}:
+        story_type = "visual_event"
     try:
         story_strength = int(result.get("story_strength", 0))
         payoff_strength = int(result.get("payoff_strength", 0))
     except (TypeError, ValueError):
         story_strength = payoff_strength = 0
-    all_cuts_usable = bool(cut_evidence) and all(bool(item.get("usable")) for item in cut_evidence)
-    if verdict == "ready" and (not str(result.get("story") or "").strip() or not facts or not has_usable or not all_cuts_usable or story_strength < 7 or payoff_strength < 7):
+    usable_count = sum(1 for item in cut_evidence if bool(item.get("usable")))
+    minimum_strength = 6 if story_type in {"conversation_banter", "food_reaction"} else 7
+    minimum_usable_ratio = 0.65 if story_type in {"conversation_banter", "food_reaction"} else 1.0
+    usable_ratio = usable_count / len(cut_evidence) if cut_evidence else 0.0
+    if verdict == "ready" and (
+        not str(result.get("story") or "").strip()
+        or not facts
+        or not has_usable
+        or usable_ratio < minimum_usable_ratio
+        or story_strength < minimum_strength
+        or payoff_strength < minimum_strength
+    ):
         verdict = "reject"
         result["rejection_reason"] = "명확한 사건·결말을 뒷받침할 예정 컷 화면 근거가 부족함"
     return {
         "candidate_id": str(candidate.get("candidate_id") or ""),
         "verdict": verdict,
+        "story_type": story_type,
         "story": str(result.get("story") or "").strip(),
         "grounded_title_facts": facts,
         "safe_hook": str(result.get("safe_hook") or "").strip(),

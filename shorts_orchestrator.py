@@ -760,6 +760,16 @@ def source_safety_reason(config: dict[str, Any], source: dict[str, Any]) -> str:
     normalized_title = re.sub(r"\s+", " ", title).strip().casefold()
     normalized_channel = re.sub(r"\s+", " ", channel).strip().casefold()
 
+    # Category 24 is not a Korean-variety-only category.  Music promotional
+    # uploads regularly rank there, but they do not provide the dialogue and
+    # action/reaction structure this pipeline is designed to re-edit.
+    music_promo_markers = (
+        "official visualizer", "official music video", "official mv",
+        "official audio", "lyric video", "music video", "m/v",
+    )
+    if any(marker in normalized_title for marker in music_promo_markers):
+        return f"music promotional source is outside the variety workflow: {title}"
+
     # YouTube's Entertainment category contains music and global fan content
     # as well as Korean variety.  For this Korean variety workflow, reject a
     # title with no meaningful Hangul signal before downloading it.
@@ -923,7 +933,12 @@ def acquire_selected_trend_source(
             },
         )
 
-    if not any(is_eligible_longform(candidate) for candidate in candidates):
+    eligible_primary = [candidate for candidate in candidates if is_eligible_longform(candidate)]
+    # One technically eligible chart result is not a resilient acquisition
+    # pool: downloads can fail or the video can turn out visually unusable.
+    # Top up from the broad creator/channel scan whenever the primary chart
+    # cannot supply the configured number of genuine attempts.
+    if len(eligible_primary) < max_attempts:
         trend = config.get("trend", {}) if isinstance(config.get("trend"), dict) else {}
         fallback_path = BASE_DIR / "analysis" / "trends" / "broad_longform_fallback.json"
         command = [
@@ -963,7 +978,12 @@ def acquire_selected_trend_source(
             }
         )
         if eligible_fallbacks:
-            candidates = eligible_fallbacks
+            primary_ids = {str(candidate.get("video_id") or "") for candidate in candidates}
+            candidates = candidates + [
+                candidate
+                for candidate in eligible_fallbacks
+                if str(candidate.get("video_id") or "") not in primary_ids
+            ]
 
     for candidate in candidates:
         source_url = str(candidate.get("source_url") or "").strip()
@@ -1274,7 +1294,10 @@ def record_metrics_snapshot(
 def reschedule_metric_checks(conn: sqlite3.Connection, *, now: datetime | None = None) -> int:
     """Apply the current short-form checkpoint policy to existing uploads."""
     observed = now or utc_now()
-    rows = conn.execute("SELECT youtube_video_id, published_at FROM published_shorts").fetchall()
+    rows = conn.execute(
+        "SELECT youtube_video_id, published_at FROM published_shorts "
+        "WHERE status != 'archived_previous_channel'"
+    ).fetchall()
     changed = 0
     for row in rows:
         published_at = parse_time(str(row["published_at"] or ""))
@@ -1419,6 +1442,7 @@ def latest_evaluated_metrics(conn: sqlite3.Connection) -> list[dict[str, Any]]:
         JOIN published_shorts
           ON published_shorts.youtube_video_id = metrics_snapshots.youtube_video_id
         WHERE metrics_snapshots.checkpoint IN ('1h', '3h', '6h', '12h', '24h')
+          AND published_shorts.status IN ('watching', 'learned')
         ORDER BY observed_at DESC
         """
     ).fetchall()
@@ -2421,7 +2445,10 @@ def youtube_upload_metadata(package_path: Path) -> dict[str, Any]:
 def latest_channel_publish_anchor(service: Any, conn: sqlite3.Connection) -> datetime | None:
     """Find the latest actual or scheduled publication across the connected channel."""
     anchors: list[datetime] = []
-    for row in conn.execute("SELECT published_at FROM published_shorts WHERE published_at != ''").fetchall():
+    for row in conn.execute(
+        "SELECT published_at FROM published_shorts "
+        "WHERE published_at != '' AND status != 'archived_previous_channel'"
+    ).fetchall():
         recorded = parse_time(str(row["published_at"] or ""))
         if recorded:
             anchors.append(recorded)
@@ -2511,6 +2538,21 @@ def parse_daily_publish_slots(schedule: dict[str, Any]) -> list[tuple[int, int]]
     if not slots:
         raise RuntimeError("At least one publish_schedule.daily_slots value is required for daily_slots mode.")
     return sorted(slots)
+
+
+def parse_explicit_kst_publish_time(value: str) -> datetime:
+    """Parse an operator-requested KST publishing time for a one-off upload."""
+    raw = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("--schedule-at must be a KST time such as '2026-08-03 18:00'.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=KST)
+    scheduled = parsed.astimezone(timezone.utc)
+    if scheduled <= utc_now():
+        raise RuntimeError("--schedule-at must be in the future.")
+    return scheduled
 
 
 def fixed_daily_publish_schedule(
@@ -2763,6 +2805,7 @@ def upload_approved_reviews(
     limit: int,
     output_path: Path | None = None,
     publish_now: bool = False,
+    schedule_at: str = "",
 ) -> dict[str, Any]:
     filters = [
         "review_items.review_status = 'approved'",
@@ -2816,7 +2859,14 @@ def upload_approved_reviews(
         analytics,
         interactive=bool(analytics.get("interactive_on_first_run", False)),
     )
-    if publish_now:
+    if publish_now and schedule_at:
+        raise RuntimeError("Use either publish_now or schedule_at, not both.")
+    if schedule_at:
+        if len(rows) != 1:
+            raise RuntimeError("--schedule-at requires exactly one approved output. Pass --output.")
+        publish_times = [parse_explicit_kst_publish_time(schedule_at)]
+        schedule_info = {"anchor_at": "", "first_publish_at": iso_time(publish_times[0]), "mode": "explicit_kst"}
+    elif publish_now:
         # Explicit operator choice for a one-off immediate release.  The
         # normal daily-slot policy remains active for every later upload.
         publish_times = [None] * len(rows)
@@ -2993,7 +3043,9 @@ def audit_recent_channel_uploads(
     ).execute().get("items", []) if video_ids else []
     known_ids = {
         str(row["youtube_video_id"] or "")
-        for row in conn.execute("SELECT youtube_video_id FROM published_shorts").fetchall()
+        for row in conn.execute(
+            "SELECT youtube_video_id FROM published_shorts WHERE status != 'archived_previous_channel'"
+        ).fetchall()
     }
     source_video_ids = {
         youtube_video_id_from_url(str(video.get("snippet", {}).get("description") or ""))
@@ -3438,10 +3490,13 @@ def print_daily_summary(summary: dict[str, Any]) -> None:
 def status_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     latest_run = conn.execute("SELECT * FROM runs ORDER BY requested_at DESC LIMIT 1").fetchone()
     due = conn.execute(
-        "SELECT COUNT(*) AS count FROM published_shorts WHERE next_check_at IS NOT NULL AND next_check_at <= ?",
+        "SELECT COUNT(*) AS count FROM published_shorts "
+        "WHERE status != 'archived_previous_channel' AND next_check_at IS NOT NULL AND next_check_at <= ?",
         (iso_time(),),
     ).fetchone()
-    published = conn.execute("SELECT COUNT(*) AS count FROM published_shorts").fetchone()
+    published = conn.execute(
+        "SELECT COUNT(*) AS count FROM published_shorts WHERE status != 'archived_previous_channel'"
+    ).fetchone()
     snapshots = conn.execute("SELECT COUNT(*) AS count FROM metrics_snapshots").fetchone()
     pending_reviews = conn.execute(
         "SELECT COUNT(*) AS count FROM review_items WHERE review_status = 'needs_review'"
@@ -3526,6 +3581,7 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--limit", type=int, default=5)
     upload_parser.add_argument("--output", type=Path, help="Upload only this approved rendered MP4.")
     upload_parser.add_argument("--publish-now", action="store_true", help="Publish immediately instead of using the configured schedule. Use only for an explicit one-off release.")
+    upload_parser.add_argument("--schedule-at", default="", help="Schedule one --output at this KST time, e.g. '2026-08-03 18:00'.")
 
     youtube_status_parser = subparsers.add_parser("youtube-status", help="Verify the connected YouTube channel and optionally sync due performance checks.")
     youtube_status_parser.add_argument("--sync-metrics", action="store_true")
@@ -3590,6 +3646,26 @@ def main() -> None:
         )
         result: dict[str, Any] = {"render": render}
         if bool(args.register_review) and render.get("status") in {"completed", "partial"}:
+            # A re-render can be started independently of daily-run.  Review rows
+            # still reference a run, so persist this lightweight execution record
+            # before registering the rendered packages.
+            conn.execute(
+                """
+                INSERT INTO runs (run_id, requested_at, status, dry_run, summary_path, learning_rule_id, error_text)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO NOTHING
+                """,
+                (
+                    batch_id,
+                    iso_time(),
+                    "completed",
+                    0,
+                    str(package_root / "rerender_summary.json"),
+                    None,
+                    None,
+                ),
+            )
+            conn.commit()
             result["review"] = register_review_items(
                 conn,
                 source=source,
@@ -3659,6 +3735,7 @@ def main() -> None:
             limit=args.limit,
             output_path=args.output,
             publish_now=bool(args.publish_now),
+            schedule_at=str(args.schedule_at or ""),
         )
         print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
     elif args.command == "youtube-status":

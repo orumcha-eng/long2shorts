@@ -437,9 +437,10 @@ Rules:
 - title should feel clickable, specific, and stop-scroll friendly, but never read like a vague slogan, a calm synopsis, or a report label.
 - surface the person/role, trigger, and reaction/reversal/payoff fast whenever the footage proves them.
 - for Korean celebrity YouTube/talk sources, write titles like a high-performing entertainment short: conversational and punchy when the beat is clearly comic.
-- First write on_video_title as one complete, natural Korean entertainment headline with no line break. This is the source of truth for the on-video title.
-- Keep it concise enough to read in one glance: normally 8 to 24 visible Korean characters excluding spaces. For a clearly comic or excessive beat, a natural comment-style phrase such as "얼마나 [행동]한지 감도 안 옴 ㅋㅋ" is welcome only when the footage proves it.
+- First write one complete, natural Korean entertainment headline with no line break. It is the single source of truth: on_video_title and upload_title must be exactly the same text, so the promise viewers see on YouTube is repeated unchanged at the top of the video.
+- Keep it concise enough to read in one glance: normally 8 to 24 visible Korean characters excluding spaces. A natural comment-style observation such as "어디까지 [행동]하고 싶은지 감도 안 온다는 [인물]" or "얼마나 [행동]한지 감도 안 옴" is welcome when the footage proves a real contrast, irony, disproportion, or admiration—not only when it is a joke. Never add "ㅋㅋ" by default; add it only if the actual payoff itself is laughter-first.
 - For backward-compatible JSON, title_line1 must equal on_video_title exactly and title_line2 must be an empty string. Never split the title into two lines.
+- If a person's name is visibly/audibly established in the source, use that name rather than generic labels such as "출연자", "여성", or "남성". If the name is genuinely unknown, use a natural role or relationship label such as "일본인 아내" or "첫 연애 중인 여자"—never invent a name.
 - title_highlight must be one short, meaningful word or phrase copied exactly from on_video_title (normally 2 to 8 visible characters). It is the only part rendered in yellow; choose the punchline, object, reaction, or meme phrase, never a random first word.
 - Before returning the title, read on_video_title as a standalone Korean sentence. It must make grammatical sense and plainly answer who did what and why the viewer should care. Rewrite any headline that sounds like a literal machine summary, has an unclear subject/object, or makes a dramatic claim the footage does not directly prove.
 - Never use an unsupported ending claim such as "마지막엔", "결국", "비자", "인생", or "최종" merely to make the title bigger. If the precise outcome is not visibly or audibly proven in the selected clips, state the directly proven reaction instead.
@@ -993,9 +994,10 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
     highlight_length = len("".join(title_highlight.split()))
     if title_highlight not in on_video_title or not 2 <= highlight_length <= 8:
         return False, "title_highlight must be a 2 to 8 character phrase copied exactly from on_video_title."
-    title_text = " ".join(
-        str(result.get(key) or "") for key in ("on_video_title", "upload_title")
-    )
+    upload_title = " ".join(str(result.get("upload_title") or "").split())
+    if upload_title != on_video_title:
+        return False, "upload_title must equal on_video_title exactly so the YouTube title and on-video headline make one promise."
+    title_text = on_video_title
     if "..." in on_video_title or "…" in on_video_title:
         return False, "on_video_title contains an ellipsis; rewrite it as a complete headline."
     title_emoji_count = sum(
@@ -1005,13 +1007,12 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
     )
     if title_emoji_count > 1:
         return False, "Use at most one emoji across the full two-line title; never add a fixed decorative emoji."
-    upload_title = str(result.get("upload_title") or "")
     if any(0x1F000 <= ord(char) <= 0x1FAFF or 0x2600 <= ord(char) <= 0x27BF for char in upload_title):
         return False, "upload_title must not contain emoji."
     generic_title_shapes = ("폭발한 순간", "폭발 현장", "감탄 폭발", "웃음 폭발")
     if any(shape in title_text for shape in generic_title_shapes):
         return False, "Title uses a generic explosion phrase; name the concrete trigger and payoff instead."
-    generic_title_phrases = ("한마디 뒤", "출연자들이", "약속받았다", "말이 오간")
+    generic_title_phrases = ("한마디 뒤", "출연자들이", "약속받았다", "말이 오간", "여성", "남성", "상대역")
     if any(phrase in title_text for phrase in generic_title_phrases):
         return False, "Title uses generic passive narration; name the concrete person, food/object, line, or reaction instead."
     unsupported_title_shapes = ("마지막엔", "비자를 빈다")
@@ -1022,13 +1023,24 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         )
 
     raw_narration = result.get("narration", [])
-    if not isinstance(raw_narration, list):
-        return False, "narration must contain 0 to 2 items."
+    if not isinstance(raw_narration, list) or len(raw_narration) > 1:
+        return False, "narration must contain zero or one truly necessary editor line."
     narration = []
+    generic_narration_phrases = (
+        "독특하네", "재밌네", "웃기네", "신기하네", "대박", "난리", "이 집", "감성",
+        "그냥 봐도", "역시", "레전드",
+    )
     for item in raw_narration:
-        text = str(item.get("text", "")).strip() if isinstance(item, dict) else ""
+        text = " ".join(str(item.get("text", "")).split()) if isinstance(item, dict) else ""
         if not text:
             continue
+        visible_length = len("".join(text.split()))
+        if not 8 <= visible_length <= 24:
+            return False, "Narration must be 8 to 24 visible characters or be omitted."
+        if any(phrase in text for phrase in generic_narration_phrases):
+            return False, "Narration is a generic reaction; name the concrete person, object, action, or reversal instead."
+        if text.endswith((".", "!", "?")):
+            text = text[:-1].rstrip()
         try:
             target_start = float(item.get("target_start"))
         except Exception:
@@ -1065,6 +1077,40 @@ def validate_final_result(result: dict) -> tuple[bool, str]:
         if len(captions) >= 3:
             break
     result["point_captions"] = captions
+
+    raw_dialogue_captions = result.get("dialogue_captions", [])
+    if not isinstance(raw_dialogue_captions, list):
+        return False, "dialogue_captions must contain 4 to 12 items."
+    dialogue_captions = []
+    for item in raw_dialogue_captions:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(str(item.get("text") or "").split())
+        speaker = str(item.get("speaker") or "").strip().casefold()
+        try:
+            target_start = float(item.get("target_start"))
+            target_end = float(item.get("target_end"))
+        except (TypeError, ValueError):
+            continue
+        if speaker not in {"left", "right"}:
+            continue
+        if not text or len(text.replace(" ", "")) > 38:
+            continue
+        target_start = max(0.0, target_start)
+        target_end = min(duration, target_end)
+        if target_end - target_start < 0.7:
+            continue
+        dialogue_captions.append({
+            "target_start": round(target_start, 3),
+            "target_end": round(target_end, 3),
+            "speaker": speaker,
+            "text": text,
+        })
+        if len(dialogue_captions) >= 12:
+            break
+    if len(dialogue_captions) < 4:
+        return False, "dialogue_captions need at least four timed source-dialogue lines with a verified left/right speaker side."
+    result["dialogue_captions"] = dialogue_captions
 
     raw_effects = result.get("sound_effects", [])
     if not isinstance(raw_effects, list):
@@ -3138,10 +3184,8 @@ def build_packaging_prompt(
         else "Selected-cut visual confirmation: unavailable. Use only the broad visual event script and transcript."
     )
     narration_requirement = (
-        "- This is the mandatory narration test package. Include exactly one narration item and set experiment.primary_variable to narration. "
-        "Use one 8 to 24 character Korean editor line near the hook or a transition; it must add irony, context, or a question rather than repeat the source dialogue."
-        if rank == 1
-        else "- Narration is optional for this package. Use it only when it adds a genuinely new editor perspective."
+        "- Narration is OFF by default. Return an empty narration list unless one line is essential to make a first-time viewer understand an otherwise unclear hook or reversal. "
+        "Do not use narration merely to make the short feel edited or to satisfy an experiment."
     )
     return f"""Source title: {SOURCE_TITLE}
 {format_movie_info_for_prompt()}
@@ -3209,6 +3253,7 @@ Task:
 - title must be exactly one concise Korean line; do not insert a line break.
 - Keep the on-video title between 8 and 24 visible characters. It must name one concrete person/role, food/object, line, or reaction—not generic passive narration such as "출연자들이", "한마디 뒤", or "약속받았다".
 - title_line1 must equal on_video_title exactly and title_line2 must be an empty string. This is a compatibility field, not a second display line.
+- upload_title must equal on_video_title exactly. Do not write a second, longer upload-only title: the uploaded title and the one-line title printed at the top of the video must be the same human-written promise.
 - title_highlight must be a 2 to 8 character phrase copied exactly from on_video_title. It is the one punchline, object, reaction, or meme phrase rendered in yellow.
 - Write the one line as a coherent, human-written entertainment headline. It may be a witty comment-style meme phrase when the scene proves it; do not reduce it to a stiff keyword fragment or report label.
 - Run a final naturalness check on the one-line title: a Korean viewer must immediately understand the subject, action, or irresistible reaction without guessing missing context. If it feels like a translated synopsis or an exaggerated conclusion, rewrite it with only the event directly shown by the selected clips.
@@ -3220,14 +3265,12 @@ Task:
 - title should surface trigger, person/role, reaction, or payoff fast
 - Do not use generic phrases such as "폭발한 순간", "폭발 현장", "감탄 폭발", or "웃음 폭발". State the unusual line, choice, accusation, mistake, or result that actually happens on screen.
 - for Korean celebrity YouTube/talk, the one line should name the trigger, person, object, situation, reaction, reversal, or payoff that is most watchable.
+- When the source establishes a real person's name, use that name in the title. Do not fall back to robotic labels such as "출연자", "여성", "남성", or "상대역". If no name is established, use a natural relationship or role label only when it is actually proven.
 - do not reuse titles or motifs from reference shorts unless the current source independently contains them
 - do not use fixed title templates; title wording must come from the current source
 - Emoji is optional. Use zero by default; never prepend the same decorative emoji to every title. When one is genuinely meaningful, use no more than one in the title.
-- for a strong comic, excessive, confused, or unexpected beat, use at most one current Korean comment-style meme phrase in either a title line, upload_title, or point caption. Good shapes include "얼마나 [행동]한지 감도 안 옴 ㅋㅋㅋ", "이게 맞아?ㅋㅋ", or "갑자기 분위기 [반전]". Use one only when the visible scene proves it; never force a meme into a serious, emotional, or neutral scene.
-- upload_title is the actual YouTube upload title, separate from the one-line on-video title. It must be a human-written Korean entertainment headline, not a mechanical duplication of the on-video title.
-- Write upload_title as one natural, specific sentence/phrase (normally 18 to 55 visible Korean characters): name the person or role, concrete action/event, and surprising reaction, consequence, motive, or reversal. It may use different wording from the on-video title.
-- Good abstract upload-title shapes: "[구체적 장면]을 [행동]한 [인물]의 변명", "더 [행동]할수록 더 [결과]가 된 [인물]", "[인물]이 [대상]을 지키려고 택한 방법". These are only human-writing shapes; never fabricate facts, names, relationships, or motives beyond the current footage.
-- Do not use a default emoji, repetitive suffix, generic "이유", or bare keyword list. A single "ㅋㅋ" is allowed only where the visible payoff is genuinely comic; otherwise omit it. Do not add hashtags here; hashtags are handled separately.
+- For a strong contrast, irony, admiration, excess, confusion, or unexpected beat, use at most one current Korean comment-style observation in the shared title or a point caption. Good shapes include "어디까지 [행동]하고 싶은지 감도 안 온다는 [인물]", "얼마나 [행동]한지 감도 안 옴", "이게 맞아?ㅋㅋ", or "갑자기 분위기 [반전]". Match the emotional register: do not add "ㅋㅋ" to admiration, tension, or earnest contrast merely because the wording is meme-like.
+- upload_title is the actual YouTube upload title and must be an exact copy of on_video_title. Do not invent a separate long synopsis, add a suffix, or alter its wording. Do not add hashtags here; hashtags are handled separately.
 - selection_pitch must explain in one Korean sentence why a human would want to click this short
 - evaluation_notes must explain how title intention, semantic meaning, and source clip structure line up for this candidate
 - timeline_answerability should be high only when a human could match this package to one clear gold timeline answer
@@ -3238,8 +3281,9 @@ Task:
 - protagonist_presence must be one of high, medium, low, unknown
 - standalone_clarity must be one of high, medium, low
 - {narration_requirement.lstrip('- ')}
-- Narration is an optional test variable. When used, write exactly one short Korean editor line (normally 8 to 24 characters) that adds context, irony, or a question the source dialogue alone does not make instantly clear. It must not paraphrase dialogue or narrate the obvious.
-- For the first package selected for a narration experiment, include exactly one narration item and set experiment.primary_variable to narration. Keep it near the hook or a transition, never on the final reaction.
+- Narration is an exceptional editorial device, not filler. When used, write exactly one 8 to 24 character Korean editor line that names a concrete person, object, action, or reversal visible in the selected clips. It must add context, irony, or a question the source dialogue alone does not make instantly clear.
+- Never use vague praise or reaction narration such as "독특하네", "재밌네", "웃기네", "대박", "난리", "이 집", or "감성". If that is all the line can say, return an empty narration list.
+- Keep any narration near the hook or a transition, never on the final reaction. The narration line must be understandable without a full sentence ending and must not paraphrase dialogue or narrate the obvious.
 - point_captions must contain 0 to 3 items; keep only the strongest caption beats
 - point caption times must be relative to the short timeline
 - write point captions like a real Korean variety-show editor, not an AI summary: short, spoken, playful, and specific to the visible beat
@@ -3248,6 +3292,9 @@ Task:
 - do not attach ㅋㅋ mechanically. Use it only where the visible action, dialogue, or reaction is genuinely comic; vary the phrasing instead of repeating one meme template.
 - when the source contains a clear laugh, fail, surprise, or group reaction, natural internet-style reactions such as "ㅋㅋㅋ", "이게 맞아?", or "와 이걸 맞히네" are welcome; never force them into a serious or neutral beat
 - avoid stiff wording such as "압권", "클릭할 수밖에", "최고의 순간", or "쇼츠입니다"
+- dialogue_captions are the primary spoken subtitles. Return 4 to 12 short, verbatim-or-faithful source dialogue lines with target times relative to the final short. They must cover the selected spoken beats, not merely the hook.
+- For every dialogue_captions item, set speaker to left or right according to the visible speaker in the selected frame. Use the visual evidence and source clip order; never alternate colours mechanically and never label a speaker when the selected line belongs to the other person.
+- Keep each dialogue caption under 38 visible Korean characters and naturally splitable into at most two lines. These captions will replace cropped source subtitles with a black lower-third band: use only words actually heard in the source, never an editor summary.
 - For an entertainment package that passes as auto_render, include exactly one sound effect when the verified visual event script or the selected clips contain a clear entrance, reveal, surprise, impact, correct/wrong answer, awkward silence, or applause payoff. Use zero only when none of those moments is actually present; do not invent a cue merely to meet a quota.
 - sound_effects may contain 0 to {MAX_SOUND_EFFECTS} cues. Use them sparingly: only for a visible entrance, transition, surprise, impact, correct/wrong answer, awkward silence, or applause payoff.
 - choose cue from: {", ".join(sorted(SOUND_EFFECT_CUES))}. Place it exactly on the related beat, keep volume around 0.18 to 0.32, and never use an effect where it would cover dialogue or feel forced.
@@ -3277,7 +3324,8 @@ Return JSON with this exact shape:
   "emotion_arc": "감정 흐름",
   "on_video_title": "상단 표시용 완전한 한 문장",
   "title_line1": "제목 1줄",
-  "title_line2": "제목 2줄",
+  "title_line2": "",
+  "title_highlight": "제목 안의 초록 강조어",
   "upload_title": "업로드용 제목 한 줄",
   "selection_pitch": "이 쇼츠가 왜 볼만한지 한 줄 설명",
   "thread_key": "반복 장난/약속/오해/계산 등 한 줄 식별자",
@@ -3332,6 +3380,20 @@ Return JSON with this exact shape:
       "target_start": 3.0,
       "target_end": 5.0,
       "text": "짧은 포인트 자막"
+    }}
+  ],
+  "dialogue_captions": [
+    {{
+      "target_start": 0.0,
+      "target_end": 2.4,
+      "speaker": "left",
+      "text": "원본에서 실제로 들리는 짧은 대사"
+    }},
+    {{
+      "target_start": 2.4,
+      "target_end": 4.8,
+      "speaker": "right",
+      "text": "상대 화자의 실제 응답 대사"
     }}
   ],
   "sound_effects": [
@@ -3507,33 +3569,35 @@ def run_final_packaging(
         candidate["global_rank"] = item["global_rank"]
         candidate["global_score"] = item["global_score"]
         candidate["selection_reason"] = item.get("selection_reason", "")
-        requires_narration = index == 1
-
+        expected_short_id = f"short_{int(item['global_rank']):02d}"
         def validate_for_rank(value: dict) -> tuple[bool, str]:
+            # The rank fixes this identifier deterministically.  Do not spend
+            # a high-cost editorial retry merely because the model omitted a
+            # mechanical filename field from an otherwise valid package.
+            if not str(value.get("short_id") or "").strip():
+                value["short_id"] = expected_short_id
+            # These are candidate-level facts already established before the
+            # final editorial pass.  Hydrate a missing summary instead of
+            # paying for another long response that recreates the same fact.
+            if not str(value.get("core_event") or "").strip() and candidate.get("core_event"):
+                value["core_event"] = candidate["core_event"]
+            if not str(value.get("emotion_arc") or "").strip() and candidate.get("emotion_arc"):
+                value["emotion_arc"] = candidate["emotion_arc"]
             ok, message = validate_final_result(value)
             if not ok:
                 return ok, message
-            if requires_narration:
-                narration = value.get("narration", [])
-                experiment = value.get("experiment", {}) if isinstance(value.get("experiment"), dict) else {}
-                if not isinstance(narration, list) or len(narration) != 1:
-                    return False, "The rank-1 narration test requires exactly one narration item."
-                if str(experiment.get("primary_variable") or "") != "narration":
-                    return False, "The rank-1 narration test must set experiment.primary_variable to narration."
             return True, ""
         context_segments = extract_candidate_context(merged_segments, candidate)
-        package_name = f"short_{int(item['global_rank']):02d}.json"
+        package_name = f"{expected_short_id}.json"
         out_path = OUTPUT_DIR / "final" / package_name
         result = None
         if out_path.exists() and not force:
             with open(out_path, "r", encoding="utf-8") as f:
                 cached = json.load(f)
-            if (
-                cached.get("candidate_id") == item["candidate_id"]
-                and cached.get("on_video_title")
-                and not BENCHMARK_PROFILE
-                and not LEARNING_RULE
-            ):
+            cached_rule = cached.get("learning_rule") if isinstance(cached.get("learning_rule"), dict) else {}
+            current_rule_id = str(LEARNING_RULE.get("rule_id") or "") if isinstance(LEARNING_RULE, dict) else ""
+            same_rule = not current_rule_id or str(cached_rule.get("rule_id") or "") == current_rule_id
+            if cached.get("candidate_id") == item["candidate_id"] and cached.get("on_video_title") and same_rule:
                 print(f"[package] using cached final package -> {package_name}", flush=True)
                 result = cached
             else:
@@ -3615,6 +3679,10 @@ def run_final_packaging(
         result["candidate_id"] = item["candidate_id"]
         result["global_rank"] = item["global_rank"]
         result["global_score"] = item["global_score"]
+        source_metadata = YOUTUBE_CONTEXT.get("metadata", {}) if isinstance(YOUTUBE_CONTEXT, dict) else {}
+        source_channel = str(source_metadata.get("channel_title") or "").strip() if isinstance(source_metadata, dict) else ""
+        if source_channel:
+            result["source_attribution"] = f"출처 | {source_channel}"
         result["hook_frame_name"] = candidate.get("hook_frame_name", "")
         result["viewer_promise"] = candidate.get("viewer_promise", "")
         for key in ["thread_key", "thread_intention", "timeline_answerability", "fragment_risk", "separation_notes"]:
@@ -3624,6 +3692,15 @@ def run_final_packaging(
         result["audience_topic_score"] = candidate.get("audience_topic_score", 0)
         if candidate.get("candidate_visual_evidence"):
             result["candidate_visual_evidence"] = candidate["candidate_visual_evidence"]
+            # The visual refinement stage, not the final prose model, is the
+            # authority for whether this candidate may render.  Some otherwise
+            # valid model responses omit the optional genre_scorecard, so keep
+            # the already-verified decision explicitly at package level.
+            verdict = str(candidate["candidate_visual_evidence"].get("verdict") or "").strip().casefold()
+            if not str(result.get("decision") or "").strip():
+                scorecard = result.get("genre_scorecard") if isinstance(result.get("genre_scorecard"), dict) else {}
+                scorecard_decision = str(scorecard.get("decision") or "").strip()
+                result["decision"] = scorecard_decision or ("auto_render" if verdict == "ready" else "needs_review")
         if LEARNING_RULE:
             result["learning_rule"] = LEARNING_RULE
         ok, message = validate_for_rank(result)

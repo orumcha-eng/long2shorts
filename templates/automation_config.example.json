@@ -1,6 +1,7 @@
 {
   "library": {
     "max_sources_per_run": 1,
+    "max_source_transcript_chars": 12000,
     "sources": [
       {
         "analysis_dir": "analysis/my_owned_longform",
@@ -26,6 +27,8 @@
     "captions_only": false,
     "download_dir": "downloads",
     "max_comments": 300,
+    "minimum_source_duration_sec": 480,
+    "maximum_source_duration_sec": 3600,
     "mark_processed_after_render": true
   },
   "benchmark_profile": "templates/benchmark_profiles/rescene_gyaru_variety.json",
@@ -33,20 +36,42 @@
     "candidate_model": "gpt-5.4",
     "final_model": "gpt-5.6-sol",
     "include_wide_windows": true,
+    "timeline_first": true,
+    "final_candidate_limit": 5,
+    "run_budget_usd": 0.0,
+    "final_package_reserve_usd": 0.0,
+    "budget_safety_usd": 0.0,
+    "candidate_visual_refinement": {
+      "enabled": true,
+      "model": "gpt-5.4",
+      "frames_per_clip": 2,
+      "candidate_limit": 10
+    },
     "force": false
   },
   "visual_events": {
     "enabled": true,
     "model": "gpt-5.4",
-    "sample_interval_sec": 12,
-    "frames_per_batch": 6,
-    "max_frames": 180
+    "sample_interval_sec": 20,
+    "frames_per_batch": 12,
+    "max_frames": 120
+  },
+  "source_visual_gate": {
+    "enabled": true,
+    "sample_count": 12,
+    "max_bright_document_ratio": 0.35
   },
   "production": {
     "enabled": true,
     "minimum_packages_per_source": "auto",
-    "minimum_score": 85,
+    "minimum_score": 82,
     "minimum_duration_sec_exclusive": 20.0,
+    "minimum_visual_shortability_score": 6,
+    "rendered_visual_qa": {
+      "enabled": true,
+      "max_bright_document_ratio": 0.25,
+      "sample_count": 5
+    },
     "allowed_decisions": ["auto_render"]
   },
   "source_safety": {
@@ -55,7 +80,7 @@
     "blocked_terms": ["런닝맨", "running man", "정치", "대통령", "민주당", "국민의힘", "선거", "국회", "이재명", "한동훈"],
     "blocked_channels": [
       "런닝맨 - 스브스 공식 채널", "개그콘서트", "KBS Entertain", "KBS Drama", "KBS Joy",
-      "SBS Entertainment", "SBS Plus", "SBS Catch", "MBCentertainment", "MBC every1", "TV-People", "TVPP",
+      "SBS Entertainment", "SBS Plus", "SBS Catch", "MBCentertainment", "MBC every1", "TV-People", "TVPP", "CORTIS",
       "JTBC Entertainment", "tvN D ENT", "TVCHOSUN - TV조선", "놀면 뭐하니?", "어서와 한국은 처음이지"
     ],
     "blocked_channel_keywords": [
@@ -75,17 +100,17 @@
     "low_average_view_percentage": 60.0
   },
   "youtube_analytics": {
-    "enabled": false,
+    "enabled": true,
     "oauth_client_secret_path": "secrets/youtube_oauth_client.json",
     "token_path": "secrets/youtube_analytics_token.json",
     "interactive_on_first_run": false
   },
   "youtube_upload": {
-    "enabled": false,
+    "enabled": true,
     "require_review_approval": true,
-    "privacy_status": "private",
+    "privacy_status": "public",
     "publish_schedule": {
-      "enabled": false,
+      "enabled": true,
       "mode": "daily_slots",
       "daily_slots": ["09:00", "12:00", "15:00", "18:00", "21:00"],
       "interval_hours": 4

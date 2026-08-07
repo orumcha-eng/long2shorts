@@ -26,10 +26,10 @@ DEFAULT_FONT_PATH = Path(r"C:\Windows\Fonts\Pretendard-ExtraBold.ttf")
 FALLBACK_FONT_PATH = Path(r"C:\Windows\Fonts\malgunbd.ttf")
 CANVAS_WIDTH = 1080
 CANVAS_HEIGHT = 1920
-# New channel template: a clean black matte lets horizontal source footage
-# breathe without pretending to be a mobile-player screenshot.  It also keeps
-# branding separate from the source channel credit.
-VIDEO_VISIBLE_TOP = 260
+# Brand template reconstructed from the published "이것도봐바" Shorts.  The
+# footage stays in a compact player card between a white editorial header and
+# the familiar player controls instead of being surrounded by a generic matte.
+VIDEO_VISIBLE_TOP = 412
 VIDEO_VISIBLE_BOTTOM = 1488
 VIDEO_VISIBLE_HEIGHT = VIDEO_VISIBLE_BOTTOM - VIDEO_VISIBLE_TOP
 FPS = 30
@@ -40,12 +40,13 @@ DEFAULT_TEMPLATE_IMAGE_CANDIDATES = [
     BASE_DIR / "short_template.png",
 ]
 BRAND_CHANNEL_NAME = os.environ.get("SHORTS_BRAND_NAME", "이것도봐바").strip() or "이것도봐바"
-BRAND_LABEL_BOX = (52, 32, 1028, 72)
-# The in-video headline is intentionally one short editorial sentence.  Two
-# fixed lines made every package feel like the same old template and made
-# conversational meme phrasing look overly formal.
-TITLE_SINGLE_LINE_BOX = (52, 84, 1028, 238)
-SOURCE_CREDIT_BOX = (80, 1555, 1000, 1642)
+BRAND_HANDLE = os.environ.get("SHORTS_BRAND_HANDLE", "@이것도재밌다").strip() or "@이것도재밌다"
+# A compact one-line headline sits inside the rounded white title chip.
+TITLE_SINGLE_LINE_BOX = (112, 260, 968, 370)
+SOURCE_CREDIT_BOX = (92, 1518, 740, 1594)
+TEMPLATE_BACKGROUND = (250, 250, 247, 255)
+TEMPLATE_INK = (18, 18, 18, 255)
+TEMPLATE_GREEN = (20, 228, 108, 255)
 SFX_DIR = BASE_DIR / "필수 효과음 100종"
 SFX_FILE_HINTS = {
     "entrance": ("01-9 띠링", "01-8 뽕", "01-7 띵"),
@@ -58,8 +59,12 @@ SFX_FILE_HINTS = {
     "applause": ("03-11 박수+환호", "25-1 응원 소리"),
 }
 COLOR_PALETTES = (
-    {"title1": (255, 255, 255), "title2": (255, 220, 54), "caption": (255, 238, 92), "source": (204, 204, 204)},
+    {"title1": (18, 18, 18), "title2": (20, 228, 108), "caption": (255, 238, 92), "source": (204, 204, 204)},
 )
+# Dialogue subtitles are deliberately independent from any text baked into the
+# source video.  A side-by-side reframe can crop that baked text, whereas this
+# track remains centred, legible, and consistently branded.
+DIALOGUE_CAPTION_MAX_CHARS = 19
 
 # The visible footage area is deliberately shorter than the whole 9:16 canvas
 # because the channel header and source credit sit above and below it.
@@ -71,10 +76,11 @@ FACE_CASCADE_PATH = Path(cv2.data.haarcascades) / "haarcascade_frontalface_defau
 # Changing voices between packages makes the channel feel automated instead of
 # edited by one consistent narrator.
 NARRATION_VOICE = "shimmer"
-NARRATION_SPEED = 1.12
+NARRATION_SPEED = 1.04
 NARRATION_INSTRUCTIONS = (
-    "Speak natural Korean like one warm, quick-witted female variety-show editor. "
-    "Keep it short, conversational, and never theatrical."
+    "Speak natural Korean like one restrained, warm female variety-show editor. "
+    "Use a conversational creator tone with clear diction and a light reaction, never an announcer, "
+    "synthetic assistant, or theatrical character voice."
 )
 # A narration is a brief editor comment, not the programme dialogue.  Keep its
 # label safely below any source caption which commonly sits at the top of a
@@ -107,6 +113,28 @@ def positive_float(value: object, fallback: float) -> float:
         return max(0.0, float(value))
     except (TypeError, ValueError):
         return fallback
+
+
+def approved_narration_items(package: dict) -> list[dict]:
+    """Keep narration as a high-bar editorial device, never a generic filler line."""
+    generic_phrases = (
+        "독특하네", "재밌네", "웃기네", "신기하네", "대박", "난리", "이 집", "감성",
+        "그냥 봐도", "역시", "레전드",
+    )
+    approved: list[dict] = []
+    for item in package.get("narration", []) or []:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join(str(item.get("text") or "").split()).rstrip(".!?")
+        visible_length = len("".join(text.split()))
+        if not 8 <= visible_length <= 24 or any(phrase in text for phrase in generic_phrases):
+            continue
+        start = positive_float(item.get("target_start"), 0.0)
+        approved.append({**item, "text": text, "target_start": start})
+        # One very good line is the maximum.  More narration turns a Short
+        # into a summary instead of an edited reaction story.
+        break
+    return approved
 
 
 def palette_for_package(package: dict) -> dict[str, tuple[int, int, int]]:
@@ -248,8 +276,34 @@ def prepare_template_layer(output_path: Path) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     image = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.rectangle((0, 0, CANVAS_WIDTH, VIDEO_VISIBLE_TOP), fill=(8, 8, 10, 255))
-    draw.rectangle((0, VIDEO_VISIBLE_BOTTOM, CANVAS_WIDTH, CANVAS_HEIGHT), fill=(8, 8, 10, 255))
+    draw.rectangle((0, 0, CANVAS_WIDTH, VIDEO_VISIBLE_TOP), fill=TEMPLATE_BACKGROUND)
+
+    # Reuse the established player-control artwork from the old template;
+    # only its former channel header is deliberately discarded.
+    template = resolve_template_image()
+    if template:
+        with Image.open(template) as source:
+            footer = source.convert("RGBA").resize((CANVAS_WIDTH, CANVAS_HEIGHT), Image.Resampling.LANCZOS)
+            image.alpha_composite(footer.crop((0, VIDEO_VISIBLE_BOTTOM, CANVAS_WIDTH, CANVAS_HEIGHT)), (0, VIDEO_VISIBLE_BOTTOM))
+    else:
+        draw.rectangle((0, VIDEO_VISIBLE_BOTTOM, CANVAS_WIDTH, CANVAS_HEIGHT), fill=TEMPLATE_BACKGROUND)
+
+    font_path = resolve_font_path()
+    regular_path = Path(r"C:\Windows\Fonts\malgun.ttf")
+    regular = regular_path if regular_path.exists() else font_path
+    # Top-left channel mark.
+    draw.rounded_rectangle((46, 42, 250, 164), radius=25, fill=(255, 255, 255, 255), outline=TEMPLATE_INK, width=5)
+    draw.ellipse((69, 70, 137, 138), fill=TEMPLATE_GREEN, outline=TEMPLATE_INK, width=4)
+    draw.polygon(((95, 84), (95, 124), (123, 104)), fill=(255, 255, 255, 255))
+    mark_font = ImageFont.truetype(str(font_path), 37)
+    draw.multiline_text((151, 57), "이것도\n봐바", font=mark_font, fill=TEMPLATE_INK, spacing=-7)
+    title_font = ImageFont.truetype(str(font_path), 52)
+    handle_font = ImageFont.truetype(str(regular), 28)
+    draw.text((294, 69), BRAND_CHANNEL_NAME, font=title_font, fill=TEMPLATE_INK)
+    draw.text((296, 130), f"{BRAND_HANDLE}  |  SHORTS", font=handle_font, fill=(70, 70, 70, 255))
+    draw.line((294, 184, 1008, 184), fill=(222, 222, 216, 255), width=3)
+    draw.line((294, 184, 470, 184), fill=TEMPLATE_GREEN, width=5)
+    draw.rounded_rectangle((80, 246, 1000, 383), radius=22, fill=TEMPLATE_BACKGROUND, outline=(215, 215, 210, 255), width=2)
     image.save(output_path)
     return output_path
 
@@ -319,6 +373,7 @@ def draw_highlighted_headline(
     min_font_size: int,
     fill: tuple[int, int, int, int],
     highlight_fill: tuple[int, int, int, int],
+    align: str = "left",
     stroke_width: int = 0,
     stroke_fill: tuple[int, int, int, int] = (255, 255, 255, 255),
 ) -> None:
@@ -327,7 +382,7 @@ def draw_highlighted_headline(
     if not highlight or highlight not in text:
         draw_boxed_text(
             draw, text, box, font_path=font_path, font_size=font_size,
-            min_font_size=min_font_size, fill=fill, align="left",
+            min_font_size=min_font_size, fill=fill, align=align,
             stroke_width=stroke_width, stroke_fill=stroke_fill,
         )
         return
@@ -339,7 +394,8 @@ def draw_highlighted_headline(
     full_bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
     text_height = full_bbox[3] - full_bbox[1]
     y = box[1] + max(0, ((box[3] - box[1]) - text_height) // 2)
-    x = box[0]
+    text_width = full_bbox[2] - full_bbox[0]
+    x = box[0] if align == "left" else box[0] + max(0, ((box[2] - box[0]) - text_width) // 2)
     for segment, color in ((before, fill), (highlight, highlight_fill), (after, fill)):
         if not segment:
             continue
@@ -374,42 +430,32 @@ def build_text_overlay(package: dict, package_path: Path, output_path: Path, cha
     channel_name = channel_name.strip() or infer_channel_name(package_path, package)
     palette = palette_for_package(package)
 
-    draw_boxed_text(
-        draw,
-        f"{BRAND_CHANNEL_NAME}  |  SHORTS",
-        BRAND_LABEL_BOX,
-        font_path=font_path,
-        font_size=31,
-        min_font_size=24,
-        fill=(180, 180, 180, 255),
-        align="left",
-        stroke_width=0,
-    )
-
     draw_highlighted_headline(
         draw,
         headline,
         package.get("title_highlight") or "",
         TITLE_SINGLE_LINE_BOX,
         font_path=font_path,
-        font_size=72,
-        min_font_size=44,
+        font_size=58,
+        min_font_size=38,
         fill=(*palette["title1"], 255),
         highlight_fill=(*palette["title2"], 255),
-        stroke_width=5,
-        stroke_fill=(17, 17, 17, 255),
+        align="left",
+        stroke_width=0,
     )
-    if channel_name:
+    # The visible source is editorially useful and makes the re-cut's origin
+    # unambiguous.  A package may deliberately omit it only for owned footage.
+    source_credit = " ".join(str(package.get("source_attribution") or "").split())
+    if source_credit:
         draw_boxed_text(
             draw,
-            f"원본 출처  |  {channel_name}",
+            source_credit,
             SOURCE_CREDIT_BOX,
             font_path=font_path,
-            font_size=42,
-            min_font_size=30,
-            fill=(*palette["source"], 255),
-            align="center",
-            stroke_width=0,
+            font_size=36,
+            min_font_size=26,
+            fill=(*palette["title1"], 255),
+            align="left",
         )
     image.save(output_path)
     return output_path
@@ -428,12 +474,37 @@ def build_caption_ass(package: dict, output_path: Path) -> Path:
         "[V4+ Styles]",
         "Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding",
         f"Style: Point,{font_name},82,{ass_bgr_color(palette['caption'])},&H000000FF,&H00101010,&H9A000000,-1,0,0,0,100,100,0,0,1,9,3,2,70,70,920,1",
+        # BorderStyle=3 makes a stable opaque box in libass.  This masks
+        # clipped programme subtitles underneath and keeps the two speakers
+        # readable even over a busy split screen.
+        f"Style: SpeakerWhite,{font_name},60,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,3,14,0,2,86,86,650,1",
+        f"Style: SpeakerGreen,{font_name},60,&H006CE414,&H000000FF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,3,14,0,2,86,86,650,1",
         "Style: Narration,Pretendard ExtraBold,48,&H00FFFFFF,&H000000FF,&H00251A38,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,8,70,70,0,1",
         "",
         "[Events]",
         "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text",
     ]
-    for caption in package.get("point_captions", []) or []:
+    dialogue_captions = [
+        item for item in (package.get("dialogue_captions", []) or []) if isinstance(item, dict)
+    ]
+    # When dialogue captions are supplied, they replace sparse editor labels.
+    # Running both stacks made the visual language noisy and can obscure the
+    # speaker's own line.
+    for caption in dialogue_captions:
+        start = positive_float(caption.get("target_start"), 0.0)
+        end = positive_float(caption.get("target_end"), start + 2.0)
+        raw_text = str(caption.get("text") or "").strip()
+        display_lines = split_display_lines(raw_text, DIALOGUE_CAPTION_MAX_CHARS)
+        # Pass real line breaks to the ASS escaper.  Passing a literal ``\N``
+        # first caused it to be escaped once more and could show a stray
+        # backslash instead of a normal two-line subtitle.
+        text = animated_ass_text("\n".join(display_lines)) if display_lines else ""
+        speaker = str(caption.get("speaker") or caption.get("speaker_side") or "").strip().casefold()
+        style = "SpeakerGreen" if speaker in {"b", "right", "speaker_b", "speaker_b_right", "green", "연두"} else "SpeakerWhite"
+        if text and end > start:
+            lines.append(f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},{style},,0,0,0,,{text}")
+
+    for caption in ([] if dialogue_captions else (package.get("point_captions", []) or [])):
         if not isinstance(caption, dict):
             continue
         start = positive_float(caption.get("target_start"), 0.0)
@@ -441,9 +512,7 @@ def build_caption_ass(package: dict, output_path: Path) -> Path:
         text = animated_ass_text(str(caption.get("text") or "").strip())
         if text and end > start:
             lines.append(f"Dialogue: 0,{format_ass_time(start)},{format_ass_time(end)},Point,,0,0,0,,{text}")
-    for narration in package.get("narration", []) or []:
-        if not isinstance(narration, dict):
-            continue
+    for narration in approved_narration_items(package):
         start = positive_float(narration.get("target_start"), 0.0)
         text = animated_ass_text(str(narration.get("text") or "").strip())
         # The voice clip usually runs 1 to 2 seconds.  Keep this caption long
@@ -515,8 +584,7 @@ def media_duration_sec(path: Path) -> float:
 
 def build_narration_tracks(package: dict, output_path: Path) -> list[dict]:
     """Create concise Korean editor narration clips and cache them per text."""
-    raw_items = package.get("narration", []) or []
-    items = [item for item in raw_items if isinstance(item, dict) and str(item.get("text") or "").strip()][:2]
+    items = approved_narration_items(package)
     if not items:
         return []
     load_project_env()
@@ -660,6 +728,25 @@ def plan_clip_reframes(source_video: Path, clips: list[dict]) -> list[dict]:
             start = positive_float(clip.get("source_start"), 0.0)
             end = positive_float(clip.get("source_end"), start + 0.5)
             duration = max(0.25, end - start)
+            # A reviewed package may name the speaker/subject that must stay
+            # in frame.  Use this explicit composition before face detection:
+            # a detector can notice only the listener in a two-person shot,
+            # which otherwise leaves the actual speaker half out of frame.
+            manual_focus = clip.get("reframe_focus_x")
+            try:
+                manual_focus = float(manual_focus)
+            except (TypeError, ValueError):
+                manual_focus = None
+            if manual_focus is not None:
+                manual_focus = max(0.0, min(1.0, manual_focus))
+                plans.append({
+                    "mode": "focus",
+                    "center_x": manual_focus,
+                    "keyframes": [{"time": start, "center_x": manual_focus}],
+                    "source_width": source_width,
+                    "source_height": source_height,
+                })
+                continue
             sample_times = list(np.arange(start + 0.12, max(start + 0.13, end - 0.10), 0.55))
             if not sample_times or sample_times[-1] < end - 0.12:
                 sample_times.append(max(start + 0.12, end - 0.12))

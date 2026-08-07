@@ -83,3 +83,4 @@ CapCut 초안 생성:
 
 - `docs/PROJECT_STRUCTURE.md`: 다음 구조 정리 방향
 - `docs/CAPCUT_STYLE_JSON.md`: CapCut 스타일 JSON 옵션
+- `docs/HOME_PC_SETUP.md`: 집 PC·새 OpenAI/YouTube 계정 이전 및 첫 실행 절차
